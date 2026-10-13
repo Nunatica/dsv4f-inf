@@ -1,0 +1,13 @@
+{
+  "date": "2026-10-12T10:37:29.323445+00:00",
+  "hardware": "RX 7900 XTX · Ryzen 9 9900X · DDR5 192 GB",
+  "prompt": "Explain story of the romance of three kingdoms.",
+  "median": 20.376640540176716,
+  "runs": [
+    20.505275829866275,
+    20.376640540176716,
+    20.254808682965358
+  ],
+  "conditions": "Reasoning off · MTP on (Q4_0 head, draft max 1, p_min 0.25) · expert cache 9984 MiB · context 65,536 · target/draft KV Q8_0 · temperature 0 · seed 42 · prompt cache off · 32-token warm-up followed by 3 runs of 128 tokens. Measured with a short context; these results do not represent performance with a full context.",
+  "source": "logs/mtp-final-benchmark.json"
+}

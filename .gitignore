@@ -1,0 +1,24 @@
+# Build output directories (including vendored projects)
+build*/
+cmake-build*/
+bin/
+CMakeFiles/
+
+# Compiled objects, libraries, and executables
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+*.pdb
+
+/logs/
+/state/
+__pycache__/
+*.pyc
+docs_dev

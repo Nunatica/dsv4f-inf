@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#101416">
+<title>DeepSeek Flash</title><link rel="stylesheet" href="./app.css"><script type="module" src="./app.js"></script>
+</head>
+<body>
+<aside id="sidebar" aria-label="Menu">
+  <a class="brand" href="#chat"><span class="brand-mark" aria-hidden="true">D</span><span>DeepSeek Flash<small>LOCAL INFERENCE</small></span></a>
+  <button id="new-chat" class="primary" type="button">＋ New chat</button>
+  <nav aria-label="Views"><button id="tab-chat" class="nav-button active" type="button" aria-controls="view-chat" aria-current="page"><span aria-hidden="true">◌</span>Chat</button><button id="tab-report" class="nav-button" type="button" aria-controls="view-report"><span aria-hidden="true">▥</span>Performance report</button></nav>
+  <div class="history-heading"><span>Chat history</span><span id="chat-count">0</span></div>
+  <input id="search" type="search" placeholder="Search conversations" aria-label="Search conversations" autocomplete="off">
+  <div id="chat-list" aria-label="Saved conversations"></div>
+  <div class="sidebar-footer"><span class="status-dot" id="status-dot"></span><span id="status" role="status">Checking connection</span><small>Conversations are saved in this browser.</small></div>
+  <div id="sidebar-resizer" role="separator" tabindex="0" aria-label="Resize sidebar" aria-orientation="vertical" aria-controls="sidebar" title="Drag to resize the sidebar · Arrow keys also work"></div>
+</aside>
+<button id="scrim" type="button" aria-label="Close menu" hidden></button>
+<main>
+  <header class="topbar"><button id="menu-toggle" type="button" aria-label="Open menu" aria-controls="sidebar" aria-expanded="false">☰</button><div><small id="eyebrow">Conversation</small><h1 id="page-title">New chat</h1></div><span id="live-speed" role="status">Getting ready</span><button id="settings-open" type="button" aria-label="Generation settings" aria-controls="settings-panel" aria-expanded="false">⚙ Settings</button></header>
+  <div id="storage-warning" class="notice warning" role="alert" hidden></div>
+  <section id="view-chat" aria-labelledby="tab-chat">
+    <div class="chat-toolbar"><span id="chat-date"></span><button id="rename-chat" type="button">Rename</button><button id="delete-chat" class="danger" type="button">Delete</button></div>
+    <div id="messages" aria-label="Conversation messages"></div>
+    <form id="form"><label class="sr-only" for="prompt">Message</label><textarea id="prompt" rows="3" placeholder="Type a message…" required></textarea><div class="composer-actions"><label class="attach" for="image">＋ Image<input id="image" type="file" accept="image/*" class="sr-only"></label><span id="attachment-name"></span><button id="remove-image" type="button" hidden aria-label="Remove attached image">×</button><span class="shortcut">Ctrl + Enter to send</span><button id="stop" type="button" hidden>Stop</button><button id="send" class="primary" type="submit" disabled>Send ↑</button></div><div id="error" role="alert"></div></form>
+  </section>
+  <section id="view-report" aria-labelledby="tab-report" hidden>
+    <div class="report-head"><div><h2>Performance report</h2><p>Actual response measurements recorded in this browser.</p></div><button id="export-report" type="button">Save JSON ↓</button></div>
+    <div id="report-cards" class="metric-grid"></div>
+    <section class="panel"><h3>Server settings</h3><div id="server-settings" class="settings-grid">Settings will appear when connected to the server.</div></section>
+    <section class="panel"><div class="panel-head"><h3>Response measurements</h3><span id="report-count" class="muted"></span></div><div class="table-scroll"><table><thead><tr><th>Conversation / Time</th><th>Status</th><th>Output tokens</th><th>Decoding</th><th>First token</th><th>Total time</th></tr></thead><tbody id="report-rows"></tbody></table></div><p class="note">tok/s uses native decoding measurements from the server. Time to first token and total time are measured by the browser and include network and wait times. Stopped and failed responses are excluded from summary statistics.</p></section>
+    <section class="panel"><div class="panel-head"><h3>Engine benchmark history</h3><span class="badge">Past measurement</span></div><div id="benchmark">Loading measurements…</div></section>
+  </section>
+</main>
+<dialog id="settings-panel" aria-labelledby="settings-title">
+  <div class="settings-head"><div><small>GENERATION</small><h2 id="settings-title">Generation settings</h2></div><button id="settings-close" type="button" aria-label="Close settings">×</button></div>
+  <p>Saved settings apply starting with the next message.</p>
+  <form id="settings-form">
+    <label for="s-api-key">API key <span>Used to connect to the server · Default: dummykey</span></label><input id="s-api-key" type="password" autocomplete="off">
+    <label for="s-temperature">Temperature <span>0 selects the most likely token</span></label><input id="s-temperature" name="temperature" type="number" min="0" max="2" step="0.05" required>
+    <label for="s-reasoning">Reasoning effort <span>Controls how much the model reasons</span></label><select id="s-reasoning" name="reasoning"><option value="none">Off</option><option value="low">Low</option><option value="high">High</option><option value="max">Max</option></select>
+    <label for="s-budget">Reasoning token budget <span>Applies when reasoning is enabled.</span></label><input id="s-budget" name="reasoning_budget" type="number" min="1" max="65536" step="1" required>
+    <label for="s-top-p">Top-p <span>Cumulative probability threshold · 1 means no limit</span></label><input id="s-top-p" name="top_p" type="number" min="0.01" max="1" step="0.01" required>
+    <label for="s-top-k">Top-k <span>Number of candidate tokens · 0 means no limit</span></label><input id="s-top-k" name="top_k" type="number" min="0" max="100000" step="1" required>
+    <label for="s-min-p">Min-p <span>Threshold relative to the highest probability · 0 means no limit</span></label><input id="s-min-p" name="min_p" type="number" min="0" max="1" step="0.01" required>
+    <label for="s-max-tokens">Maximum output tokens <span>Total output limit, including reasoning tokens</span></label><input id="s-max-tokens" name="max_tokens" type="number" min="1" max="65536" step="1" required>
+    <div class="notice" id="settings-feedback" role="status" hidden></div>
+    <div class="settings-actions"><button id="settings-reset" type="button">Defaults</button><button class="primary" type="submit">Save settings</button></div>
+  </form>
+</dialog>
+<dialog id="chat-dialog"><form method="dialog" id="dialog-form"><h2 id="dialog-title"></h2><p id="dialog-description"></p><label id="title-label" for="chat-title">Conversation name</label><input id="chat-title" maxlength="100" autocomplete="off"><div class="dialog-actions"><button value="cancel" formnovalidate>Cancel</button><button id="dialog-confirm" value="confirm" class="primary">Save</button></div></form></dialog>
+</body></html>
