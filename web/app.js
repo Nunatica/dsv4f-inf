@@ -8,7 +8,15 @@ const seconds = ms => Number.isFinite(ms) ? `${number(ms / 1000, 2)} s` : '—';
 const date = iso => new Date(iso).toLocaleString('en-US', {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'});
 const make = (tag, className, text) => { const el = document.createElement(tag); if (className) el.className = className; if (text !== undefined) el.textContent = text; return el; };
 const textOf = content => typeof content === 'string' ? content : (content || []).filter(x => x.type === 'text').map(x => x.text).join('\n');
-const uid = () => crypto.randomUUID();
+const uid = () => {
+  if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+  // LAN HTTP is not a secure context; getRandomValues is still available there.
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+};
 const newChat = () => ({id: uid(), title: 'New chat', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), messages: [], draft: ''});
 let chats = [], activeId, db, busy = false, controller = null, ready = false, props = null, benchmark = null, saveTimer, saveChain = Promise.resolve();
 let view = location.hash === '#report' ? 'report' : 'chat';

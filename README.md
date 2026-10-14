@@ -81,6 +81,8 @@ The launcher requires swap protection: either system swap must already be disabl
 
 Once ready, open `http://localhost:8080`. The default API key is `dummykey`; set `API_KEY`, `HOST`, and `PORT` before starting to override the defaults.
 
+For access from another device on your LAN, open `http://<server-local-ip>:8080` (for example, `http://192.168.0.64:8080`). The default `HOST=0.0.0.0` listens on all interfaces, and the web UI supports plain HTTP without SSL. Chat IDs use `crypto.getRandomValues()` when `crypto.randomUUID()` is unavailable on HTTP.
+
 ## Performance
 At target system, it reached to 230 tok/s for prefill and 18.93 tok/s for decode.
 For comparison, llama cpp gives you 197 tok/s for prefill and 12.43 tok/s for decode with moe expert cache + mtp.

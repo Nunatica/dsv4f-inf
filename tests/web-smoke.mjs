@@ -1,6 +1,15 @@
 // Component smoke test with a minimal DOM and IndexedDB API double. No browser automation.
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
+import {webcrypto} from 'node:crypto';
+const httpMode = process.argv.includes('--http');
+let uuidFallbackCalls = 0;
+if (httpMode) {
+  // LAN HTTP exposes getRandomValues, but not the secure-context-only randomUUID.
+  Object.defineProperty(globalThis, 'crypto', {configurable: true, value: {
+    getRandomValues(bytes) { uuidFallbackCalls++; return webcrypto.getRandomValues(bytes); }
+  }});
+}
 class Element {
   constructor(tag='div') {this.tagName=tag;this.children=[];this._text='';this.value='';this.files=[];this.attributes={};this.hidden=false;this.disabled=false;this.className='';this.style={setProperty:(k,v)=>this.style[k]=v};this.classList={toggle:(v,on)=>{const a=new Set(this.className.split(' ').filter(Boolean));const next=on??!a.has(v);if(next)a.add(v);else a.delete(v);this.className=[...a].join(' ');return next;},contains:v=>this.className.split(' ').includes(v)};}
   set textContent(v){this._text=String(v);this.children=[];}
@@ -52,6 +61,8 @@ function dom(legacy=false){const els=new Map();for(const m of html.matchAll(/<([
 const flush=async()=>{for(let i=0;i<30;i++)await Promise.resolve();};
 let $=dom();await import(new URL('../web/app.js?smoke=1', import.meta.url));await flush();
 assert.equal($('chat-count').textContent,'1');assert.equal($('send').disabled,false);
+const initialId = disk.get('dsv4f.chats.v1').chats[0].id;
+assert.match(initialId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
 const handle=$('sidebar-resizer');
 handle.onpointerdown({button:0,isPrimary:true,pointerId:1,clientX:260,preventDefault(){}});
 handle.onpointermove({pointerId:2,clientX:500});assert.equal(document.documentElement.style['--sidebar-width'],'260px');
@@ -102,4 +113,8 @@ assert.equal(disk.get('dsv4f.chats.v1').chats[0].title,'Renamed chat');assert.eq
 $('chat-list').children[0].querySelector('.history-delete').onclick();$('chat-dialog').returnValue='confirm';$('chat-dialog').close();await flush();assert.equal($('chat-count').textContent,'1');assert.equal(disk.get('dsv4f.chats.v1').chats.length,1);assert.equal($('page-title').textContent,'New chat');assert.equal($('prompt').value,'');
 $=dom(true);await import(new URL('../web/app.js?smoke=3', import.meta.url));await flush();assert.equal($('chat-count').textContent,'1');assert.equal($('page-title').textContent,'New chat');assert.ok(!JSON.stringify(disk.get('dsv4f.chats.v1')).includes('Renamed chat'));
 assert.equal($('sidebar').lastElementChild.id,'sidebar-resizer');assert.equal(typeof $('sidebar').lastElementChild.onpointerdown,'function');
+const savedChats = disk.get('dsv4f.chats.v1').chats;
+assert.notEqual(savedChats[0].id, initialId);
+if (httpMode) assert.ok(uuidFallbackCalls >= 3, 'HTTP fallback must support initial, new and replacement chats');
+console.log(`PASS: UUID creation and chat lifecycle in ${httpMode ? 'LAN HTTP (randomUUID unavailable)' : 'native randomUUID'} mode.`);
 console.log('PASS: sidebar drag/keyboard resize, width persistence and cached-HTML compatibility, chat creation, streaming metrics and bottom scrolling, history search/switch/rename/targeted sidebar deletion/cancel, active draft preservation and last-chat deletion, saved settings in requests, reasoning display, reload persistence, partial stop and API error recovery (DOM/IndexedDB doubles).');
