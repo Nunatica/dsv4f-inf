@@ -1,5 +1,5 @@
 # dsv4f-inf
-Almost fully vibe-coded, highly experimental serving engine for DeepSeek V4 Flash.
+Almost fully vibe-coded, highly experimental inference engine for DeepSeek V4 Flash.
 
 ## Target system
 9900x (or any zen5 cpus such as 9800x3d) + 192GiB ddr5 5600mhz + 7900xtx (or nvidia gpus such 3090, 4090 which has at least 24gb vram, not tested)
@@ -84,9 +84,14 @@ Once ready, open `http://localhost:8080`. The default API key is `dummykey`; set
 For access from another device on your LAN, open `http://<server-local-ip>:8080` (for example, `http://192.168.0.64:8080`). The default `HOST=0.0.0.0` listens on all interfaces, and the web UI supports plain HTTP without SSL. Chat IDs use `crypto.getRandomValues()` when `crypto.randomUUID()` is unavailable on HTTP.
 
 ## Performance
-At target system, it reached to 355 tok/s for prefill and 19.30 tok/s for decode.
-For comparison, llama cpp gives you 197 tok/s for prefill and 12.43 tok/s for decode with moe expert cache + mtp.
-Performance test is done with same prompt from PROMPT_TEST.md
+
+| Implementation | Prefill (tok/s) | Decode (tok/s) |
+| --- | ---: | ---: |
+| dsv4f-inf | 355 | 19.30 |
+| llama cpp - moe expert cache + mtp | 197 | 12.43 |
+| llama cpp - full expert offloading + mtp | 195 | 11.33 |
+
+Data was measured at target system. test was done with same prompt with PROMPT_TEST.md
 
 ## Credits
 - llama.cpp [https://github.com/ggml-org/llama.cpp]
