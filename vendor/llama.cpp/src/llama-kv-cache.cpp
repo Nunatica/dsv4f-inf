@@ -79,7 +79,8 @@ llama_kv_cache::llama_kv_cache(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-             const char *   name_tag) :
+             const char *   name_tag,
+            uint32_t       stream_capacity) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -218,6 +219,18 @@ llama_kv_cache::llama_kv_cache(
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
+            if (stream_capacity && !hparams.no_alloc) {
+                const auto get_api = (ggml_dsv4f_kv_api_fn) ggml_backend_reg_get_proc_address(
+                        ggml_backend_dev_backend_reg(dev), "ggml_dsv4f_kv_api");
+                if (!get_api || !ggml_backend_dev_host_buffer_type(dev)) {
+                    throw std::runtime_error("KV streaming requires a CUDA/HIP backend with pinned host buffers");
+                }
+                if (!is_mla || n_embd_k_gqa != 512 || (type_k != GGML_TYPE_Q8_0 && type_k != GGML_TYPE_F16)) {
+                    throw std::runtime_error("KV streaming supports 512-dimensional Q8_0/FP16 CSA keys; set DSV4F_KV_RESIDENT=0 for other types");
+                }
+                stream_api = get_api();
+                buft = ggml_backend_dev_host_buffer_type(dev);
+            }
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
@@ -292,6 +305,16 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_backend_buffer_clear(buf, 0);
         ctxs_bufs.emplace_back(std::move(ctx), buf);
+    }
+
+    if (stream_api) {
+        for (const auto & layer : layers) {
+            const auto capacity = std::min<uint32_t>(stream_capacity, kv_size*n_stream);
+            auto * state = stream_api->create(model.dev_layer(layer.il), layer.k, capacity);
+            stream_states.emplace(layer.il, std::shared_ptr<void>(state, stream_api->destroy));
+            LLAMA_LOG_INFO("[kv-stream] layer=%u host=%.2f MiB resident=%u cells gpu=%.2f MiB\n",
+                layer.il, ggml_nbytes(layer.k)/1048576.0, capacity, stream_api->bytes(state)/1048576.0);
+        }
     }
 
     {
@@ -385,6 +408,7 @@ llama_kv_cache::llama_kv_cache(
 }
 
 void llama_kv_cache::clear(bool data) {
+    invalidate_streaming();
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
@@ -700,6 +724,15 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
     return cells.seq_pos_max(seq_id);
 }
 
+void * llama_kv_cache::get_stream_state(int32_t il) const {
+    const auto it = stream_states.find(il);
+    return it == stream_states.end() ? nullptr : it->second.get();
+}
+
+void llama_kv_cache::invalidate_streaming() const {
+    for (const auto & item : stream_states) stream_api->reset(item.second.get());
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [ctx, buf] : ctxs_bufs) {
@@ -714,6 +747,9 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() 
         }
     }
 
+    for (const auto & item : stream_states) {
+        ret[ggml_backend_dev_buffer_type(model.dev_layer(item.first))] += stream_api->bytes(item.second.get());
+    }
     return ret;
 }
 
@@ -846,6 +882,7 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
         assert(n_stream > 1 && "stream copy should never happen with a single stream");
 
         llama_synchronize(lctx);
+        invalidate_streaming();
 
         const size_t n_copy = sc_info.ssrc.size();
 
@@ -1363,6 +1400,10 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     GGML_ASSERT(ggml_row_size(k_cur->type, n_embd_head) == k_cur->nb[1]);
 
     k_cur = ggml_view_2d(ctx, k_cur, n_embd_gqa, n_tokens, k_cur->nb[2], 0);
+
+    if (auto * state = get_stream_state(il)) {
+        return ggml_dsv4f_kv_write(ctx, state, k_cur, k_idxs);
+    }
 
     const int64_t n_stream = k->ne[2];
 
@@ -2139,6 +2180,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 }
 
 void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    invalidate_streaming();
     state_read_sinfo(io, seq_id, flags, nullptr, nullptr);
 }
 

@@ -1293,10 +1293,26 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     LLAMA_LOG_INFO("%s: creating DSV4 CSA compressed KV cache, size = %u cells\n",
             __func__, dsv4_comp_size(kv_size, DSV4_CSA_RATIO));
 
+    // Same unit as Strata --kv-resident: KV cells per layer, not raw tokens.
+    uint32_t resident = 65536;
+    if (const char * value = std::getenv("DSV4F_KV_RESIDENT")) {
+        char * end = nullptr;
+        const auto parsed = std::strtoull(value, &end, 10);
+        if (!*value || *value == '-' || *end || parsed > INT32_MAX ||
+                (parsed && parsed < model.hparams.indexer_top_k)) {
+            throw std::runtime_error("DSV4F_KV_RESIDENT must be 0 or an integer >= indexer_top_k and <= INT32_MAX");
+        }
+        resident = uint32_t(parsed);
+    }
+    if (!offload || uint64_t(GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u))*n_seq_max <= resident) {
+        // Like Strata, keep the normal resident path when the whole cache fits.
+        resident = 0;
+    }
+
     kv_csa = std::make_unique<llama_kv_cache>(
             model, hparams_csa, type_k, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u), n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
+            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr, "csa_", resident);
 
     LLAMA_LOG_INFO("%s: creating DSV4 HCA compressed KV cache, size = %u cells\n",
             __func__, dsv4_comp_size(kv_size, DSV4_HCA_RATIO));
@@ -1738,6 +1754,7 @@ void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
         GGML_ASSERT((uint32_t) seq_id < n_seq_max);
 
         const auto clear_seq = [seq_id, data](llama_kv_cache * kv) {
+            kv->invalidate_streaming();
             kv->seq_rm(seq_id, -1, -1);
 
             if (data) {
@@ -1979,12 +1996,26 @@ uint32_t llama_kv_cache_dsv4_comp_context::get_n_kv() const {
     return n_kv;
 }
 
+void * llama_kv_cache_dsv4_comp_context::get_stream_state(int32_t il) const {
+    return kv->get_stream_state(il);
+}
+
+uint32_t llama_kv_cache_dsv4_comp_context::get_stream_offset() const {
+    return sinfos[i_cur].s0;
+}
+
 ggml_tensor * llama_kv_cache_dsv4_comp_context::get_k(ggml_context * ctx, int32_t il) const {
     return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_dsv4_comp_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
-    return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
+    auto * commit = kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
+    if (kv->get_stream_state(il)) stream_commits[il] = commit;
+    return commit;
+}
+
+ggml_tensor * llama_kv_cache_dsv4_comp_context::get_stream_commit(int32_t il) const {
+    return stream_commits.at(il);
 }
 
 ggml_tensor * llama_kv_cache_dsv4_comp_context::build_input_k_rot(ggml_context * ctx) const {

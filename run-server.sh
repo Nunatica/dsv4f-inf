@@ -2,7 +2,13 @@
 set -euo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 export MODEL="${MODEL:-$ROOT/models/DeepSeek-V4-Flash-Vision-Exp-UD-Q4_K_XL-00001-of-00005.gguf}"
-export CTX_SIZE=${CTX_SIZE:-65536}
+export CTX_SIZE=${CTX_SIZE:-262144}
+export DSV4F_KV_RESIDENT=${DSV4F_KV_RESIDENT:-65536}
+#export DSV4F_KV_RESIDENT=${DSV4F_KV_RESIDENT:-0}
+if [[ ! $DSV4F_KV_RESIDENT =~ ^[0-9]{1,10}$ ]] ||
+   ((10#$DSV4F_KV_RESIDENT > 2147483647 || (10#$DSV4F_KV_RESIDENT != 0 && 10#$DSV4F_KV_RESIDENT < 2048))); then
+    echo 'DSV4F_KV_RESIDENT must be 0 or an integer in 2048..2147483647.' >&2; exit 1
+fi
 export GGML_HIP_SPARSE_FA=${GGML_HIP_SPARSE_FA:-1}
 case "$GGML_HIP_SPARSE_FA" in 0|1) ;; *) echo 'GGML_HIP_SPARSE_FA must be 0 or 1.' >&2; exit 1;; esac
 export GGML_HIP_PREFILL_FA=${GGML_HIP_PREFILL_FA:-2}
@@ -47,7 +53,7 @@ case "$DSV4F_GPU_WAIT" in poll|callback) ;; *) echo 'DSV4F_GPU_WAIT must be poll
 # Pinned host weights reduce the first large prefill's expert-upload cost.
 # Decode cache misses stay on CPU. Both host buffer kinds share one allocator.
 case "$DSV4F_PINNED_WEIGHTS" in 0|1) ;; *) echo 'DSV4F_PINNED_WEIGHTS must be 0 or 1.' >&2; exit 1;; esac
-if [[ $DSV4F_PINNED_COMPUTE == 1 || $DSV4F_PINNED_WEIGHTS == 1 ]]; then
+if [[ $DSV4F_PINNED_COMPUTE == 1 || $DSV4F_PINNED_WEIGHTS == 1 ]] || ((10#$DSV4F_KV_RESIDENT > 0)); then
     unset GGML_CUDA_NO_PINNED
 else
     export GGML_CUDA_NO_PINNED=1

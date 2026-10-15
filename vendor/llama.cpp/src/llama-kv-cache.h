@@ -4,6 +4,7 @@
 #include "llama-graph.h"
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
+#include "ggml-dsv4f-kv.h"
 
 #include <unordered_map>
 #include <vector>
@@ -114,9 +115,13 @@ public:
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
         // a model can hold more than one cache, so the tensor names have to stay unique
-                 const char *   name_tag = "");
+                 const char *   name_tag = "",
+                 uint32_t       stream_capacity = 0);
 
     ~llama_kv_cache() = default;
+
+    void * get_stream_state(int32_t il) const;
+    void invalidate_streaming() const;
 
     //
     // llama_memory_i
@@ -316,6 +321,8 @@ private:
     stream_copy_info sc_info;
 
     std::vector<kv_layer> layers;
+    const ggml_dsv4f_kv_api * stream_api = nullptr;
+    std::unordered_map<int32_t, std::shared_ptr<void>> stream_states;
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;

@@ -1,5 +1,6 @@
 extern "C" void ggml_dsv4f_experts_register();
 #include "ggml-backend-moe-cache.h"
+#include "ggml-dsv4f-mmq.h"
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
@@ -29,6 +30,7 @@ extern "C" void ggml_dsv4f_experts_register();
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
+#include "ggml-cuda/dsv4f-kv.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
@@ -925,6 +927,11 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
     size_t size = tensor->op == GGML_OP_FLASH_ATTN_EXT
         ? ggml_cuda_flash_attn_ext_get_alloc_size(buft_ctx->device, tensor)
         : ggml_nbytes(tensor);
+    const ggml_dsv4f_mmq_workspace mmq_workspace(tensor);
+    if (mmq_workspace.enabled) size = mmq_workspace.size;
+    if (ggml_dsv4f_kv_op(tensor) && tensor->op_params[9] == GGML_DSV4F_KV_ATTN) {
+        size = dsv4f_kv_scratch(tensor).size;
+    }
     int64_t ne0 = tensor->ne[0];
 
     // [TAG_ALLOC_SIZE_EXPAND]
@@ -2168,6 +2175,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     switch (dst->op) {
         case GGML_OP_CUSTOM:
+            if (ggml_dsv4f_kv_op(dst)) {
+                if (dst->op_params[9] == GGML_DSV4F_KV_WRITE) ggml_cuda_dsv4f_kv_write(ctx, dst);
+                else ggml_cuda_dsv4f_kv_attn(ctx, dst);
+                break;
+            }
             if (dst->op_params[9] == GGML_DSV4F_JOIN_TAG && ggml_dsv4f_experts.gpu_finalize) {
                 if (dst->src[0]->op == GGML_OP_CUSTOM && dst->src[0]->op_params[9] == GGML_DSV4F_MOE_TAG && dst->src[0]->op_params[10])
                     ggml_dsv4f_experts.gpu_finalize(&ctx, dst->src[0]);
@@ -5446,6 +5458,10 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
 // TODO: move these functions here
 static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+    if (ggml_dsv4f_kv_op(op)) {
+        const auto * state = (const dsv4f_kv_state *) ggml_dsv4f_kv_state(op);
+        return state && state->device == dev_ctx->device;
+    }
     if (op->op == GGML_OP_CUSTOM) {
         return dev_ctx->device == 0 && (op->op_params[9] == GGML_DSV4F_MOE_TAG || op->op_params[9] == GGML_DSV4F_JOIN_TAG) &&
                ggml_dsv4f_experts.gpu_supported && ggml_dsv4f_experts.gpu_supported(op);
@@ -6079,8 +6095,19 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+static void * ggml_backend_cuda_kv_create(ggml_backend_dev_t dev, ggml_tensor * host, uint32_t slots) {
+    auto * ctx = (ggml_backend_cuda_device_context *) dev->context;
+    return ggml_cuda_dsv4f_kv_create(ctx->device, host, slots);
+}
+static const ggml_dsv4f_kv_api * ggml_backend_cuda_kv_api() {
+    static const ggml_dsv4f_kv_api api = {ggml_backend_cuda_kv_create, ggml_cuda_dsv4f_kv_destroy,
+                                       ggml_cuda_dsv4f_kv_reset, ggml_cuda_dsv4f_kv_bytes};
+    return &api;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_dsv4f_kv_api") == 0) return (void *) ggml_backend_cuda_kv_api;
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

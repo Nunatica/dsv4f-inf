@@ -6,6 +6,7 @@
 #include "fattn.cuh"
 #include "fattn-sparse.cuh"
 #include "fattn-hip-prefill.cuh"
+#include "fattn-kv-stream.cuh"
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it

@@ -13,6 +13,7 @@
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 #include "ggml-backend-moe-cache.h"
+#include "ggml-dsv4f-kv.h"
 
 // MoE expert cache function table; populated by the CUDA backend at registry
 // init when GGML_CUDA_MOE_CACHE=1, consumed by the CPU mul_mat_id kernel.
@@ -1107,6 +1108,13 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
         return cur_backend_id;
     }
 
+    // Streaming cache pointers belong to a specific GPU, including scalar
+    // commit nodes whose shape alone would otherwise prefer the CPU.
+    if (ggml_dsv4f_kv_op(tensor)) {
+        for (int b = 0; b < sched->n_backends - 1; ++b) {
+            if (ggml_backend_supports_op(sched->backends[b], tensor)) return b;
+        }
+    }
     // operations with weights are preferably run on the same backend as the weights
     if (tensor->op == GGML_OP_CUSTOM && tensor->op_params[9] == GGML_DSV4F_MOE_TAG &&
         ggml_dsv4f_experts.gpu_supported && ggml_dsv4f_experts.gpu_supported(tensor)) {
@@ -2430,6 +2438,7 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
 
 bool ggml_op_alloc_size_may_expand(enum ggml_op op) {
     switch (op) {
+        case GGML_OP_CUSTOM: // backend custom kernels can reserve graph-owned staging
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:

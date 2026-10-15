@@ -245,6 +245,10 @@ public:
             slot_info_vec_t sinfos,
             std::vector<llama_ubatch> ubatches);
 
+    void * get_stream_state(int32_t il) const;
+    uint32_t get_stream_offset() const;
+    ggml_tensor * get_stream_commit(int32_t il) const;
+
     bool next();
 
     uint32_t get_n_kv() const;
@@ -256,6 +260,10 @@ public:
     void set_input_k_rot(ggml_tensor * dst) const;
 
 private:
+    // Explicit graph edge from host-backed writes to attention, including
+    // when optional GPU graph optimization moves independent nodes to streams.
+    mutable std::unordered_map<int32_t, ggml_tensor *> stream_commits;
+
     llama_kv_cache * kv;
 
     size_t i_cur = 0;

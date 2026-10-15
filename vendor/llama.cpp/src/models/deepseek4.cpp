@@ -764,6 +764,27 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     ggml_tensor * raw_k = mctx_raw->get_k(ctx0, il);
     cb(raw_k, "csa_raw_k", il);
 
+    const auto * csa_ctx = inp_dsv4->mctx->get_csa();
+    if (auto * state = csa_ctx->get_stream_state(il)) {
+        if (!cparams.flash_attn) {
+            throw std::runtime_error("KV streaming requires flash attention; use --flash-attn on or DSV4F_KV_RESIDENT=0");
+        }
+        ggml_tensor * csa_mask = build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il);
+        ggml_tensor * mask = ggml_concat(ctx0, inp_attn->get_kq_mask(), csa_mask, 0);
+        const auto streams = raw_k->ne[3];
+        ggml_tensor * qs = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/streams, streams,
+                                      q->nb[1], q->nb[2], q->nb[2]*(q->ne[2]/streams), 0);
+        qs = ggml_permute(ctx0, qs, 0, 2, 1, 3);
+        ggml_tensor * raw = ggml_permute(ctx0, raw_k, 0, 2, 1, 3);
+        const int bound = raw_k->ne[2] + top_k->ne[0];
+        auto * out = ggml_dsv4f_kv_attn(ctx0, state, csa_ctx->get_stream_offset(),
+                                     qs, raw, mask, sinks, bound, kq_scale, csa_ctx->get_stream_commit(il));
+        out = ggml_reshape_2d(ctx0, out, out->ne[0]*out->ne[1], out->ne[2]*out->ne[3]);
+        if (k_rot) out = llama_mul_mat_hadamard(ctx0, out, k_rot);
+        cb(out, "attn_csa_streamed", il);
+        return out;
+    }
+
     ggml_tensor * csa_k = inp_dsv4->mctx->get_csa()->get_k(ctx0, il);
     const int64_t n_csa = inp_csa.kq_mask->ne[0];
     GGML_ASSERT(n_csa > 0);
