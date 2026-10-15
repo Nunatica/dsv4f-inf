@@ -168,7 +168,7 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512,  8, 128, 3,  64,  96,  64, 128, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 16, 128, 3,  64,  96,  64, 128, 1, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 32, 128, 2,  32, 128, 128, 128, 1, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 32, 128, 2,  32, 128, 128, 128, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 64, 128, 2,  32, 128, 128, 128, 1, true);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512,  8, 128, 3,  64,  96,  64, 128, 1, true);
@@ -618,6 +618,24 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr int stride_tile_V = V_is_K_view ? stride_tile_K : (swz ? nbatch_V2 : nbatch_V2 + 4);
 
     const int k_VKQ_0 = kb0 * nbatch_fa;
+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
+    if constexpr (DKQ == 512 && DV == 512 && ncols1 == 4 && ncols2 == 8 && !use_sparse && nstages == 0) {
+        // The D512 HIP prefill dispatcher requires a mask and no ALiBi.
+        // Avoid loading/multiplying KV chunks invisible to every query here.
+        bool live = false;
+        const int tid = threadIdx.y*warp_size + threadIdx.x;
+        for (int l = tid; l < ncols1*nbatch_fa; l += nwarps*warp_size) {
+            const int j = jt*ncols1 + l/nbatch_fa;
+            const int i = l%nbatch_fa;
+            if (j < int(ne01.z) && i < k_VKQ_sup) {
+                live |= __half_as_ushort(mask_h[j*stride_mask + k_VKQ_0 + i]) != 0xfc00;
+            }
+        }
+        if (!__syncthreads_or(live)) {
+            return;
+        }
+    }
+#endif
 #if defined(TURING_MMA_AVAILABLE)
     T_C_KQ KQ_C[nbatch_fa/(np*(cols_per_warp == 8 ? T_C_KQ::I : T_C_KQ::J))];
 #elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
@@ -1124,6 +1142,16 @@ template<int DKQ, int ncols> struct mma_tile_sizes {
     using T_B_VKQ = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
     using T_C_VKQ = tile<16, 16, half2, DATA_LAYOUT_I_MAJOR>;          // column-major
 };
+// D512 prefill keeps Q in LDS to leave room for FP32 VKQ fragments.
+// Unlike the FP16 accumulator layout, each fragment covers 16 V columns.
+template<int ncols> struct mma_tile_sizes<512, ncols> {
+    using T_A_KQ  = tile<16, 8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>;
+    using T_B_KQ  = tile<16, 8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>;
+    using T_C_KQ  = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;
+    using T_A_VKQ = tile<16, 8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>;
+    using T_B_VKQ = tile<16, 8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>;
+    using T_C_VKQ = tile<16, 16, float, DATA_LAYOUT_I_MAJOR>;
+};
 template<int ncols> struct mma_tile_sizes<80, ncols> {
     using T_A_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // row-major
     using T_B_KQ  = tile<16,  8, half2, DATA_LAYOUT_I_MAJOR_MIRRORED>; // column-major
@@ -1256,7 +1284,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 #if defined(TURING_MMA_AVAILABLE)
     T_C_VKQ VKQ_C[cols_per_warp == 8 ? DV/T_C_VKQ::I : DV/(2*T_C_VKQ::J)];
 #elif defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
-    T_C_VKQ VKQ_C[DV % 32 != 0       ? DV/T_C_VKQ::J : DV/(2*T_C_VKQ::J)];
+    T_C_VKQ VKQ_C[DV % 32 != 0 || std::is_same_v<decltype(T_C_VKQ::x), float[T_C_VKQ::ne]> ? DV/T_C_VKQ::J : DV/(2*T_C_VKQ::J)];
 #elif defined(AMD_MFMA_AVAILABLE)
     T_C_VKQ VKQ_C[                                     DV/T_C_VKQ::J];
 #elif defined(AMD_WMMA_AVAILABLE)
@@ -1303,7 +1331,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                     const int k = k0 + (stride_k == warp_size ? threadIdx.x : threadIdx.x % stride_k);
 
                     const float2 tmp = Q_f2[(jt*ncols1 + j)*stride_Q1 + c*stride_Q2 + k];
-                    tile_Q[jc*stride_tile_Q + k] = scale_h2 * make_half2(tmp.x, tmp.y);
+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
+                    if constexpr (DKQ == 512) {
+                        tile_Q[jc*stride_tile_Q + k] = make_half2(tmp.x*scale, tmp.y*scale);
+                    } else
+#endif
+                    {
+                        tile_Q[jc*stride_tile_Q + k] = scale_h2 * make_half2(tmp.x, tmp.y);
+                    }
                 }
             } else {
 #pragma unroll
@@ -1859,7 +1894,14 @@ static __global__ void flash_attn_ext_f16(
 #endif // __CUDA_ARCH__ == GGML_CUDA_CC_TURING
 
 #if defined(AMD_WMMA_AVAILABLE)
-    if (ncols1*ncols2 < 16 || ncols2 == 1 || DKQ > 256) {
+    // Only the explicitly dispatched 32-column RDNA3 D512 prefill layout is
+    // enabled. In particular, the old 64-column layout exceeds gfx1100 LDS.
+#if defined(RDNA3)
+    constexpr bool hip_d512 = DKQ == 512 && DV == 512 && ncols1 == 4 && ncols2 == 8;
+#else
+    constexpr bool hip_d512 = false;
+#endif
+    if (ncols1*ncols2 < 16 || ncols2 == 1 || (DKQ > 256 && !hip_d512)) {
         NO_DEVICE_CODE;
         return;
     }

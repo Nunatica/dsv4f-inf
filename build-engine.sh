@@ -16,4 +16,6 @@ case "$backend" in
     *) echo "Unknown BACKEND: $backend" >&2; exit 1;;
 esac
 cmake "${args[@]}"
-cmake --build "${BUILD_DIR:-$ROOT/build}" --target llama-server dsv4f-sparse-attn-test dsv4f-moe-test dsv4f-graph-test dsv4f-service-test dsv4f-web-http-test dsv4f-budget-test dsv4f-cache-policy-test dsv4f-mxfp4-rows-test dsv4f-prefill-test -j "${BUILD_JOBS:-12}"
+extra_targets=()
+if [[ $backend == hip ]]; then extra_targets+=(dsv4f-prefill-attn-test); fi
+cmake --build "${BUILD_DIR:-$ROOT/build}" --target llama-server dsv4f-sparse-attn-test dsv4f-moe-test dsv4f-graph-test dsv4f-service-test dsv4f-web-http-test dsv4f-budget-test dsv4f-cache-policy-test dsv4f-mxfp4-rows-test dsv4f-prefill-test "${extra_targets[@]}" -j "${BUILD_JOBS:-12}"

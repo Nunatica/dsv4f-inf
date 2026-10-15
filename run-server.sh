@@ -5,6 +5,8 @@ export MODEL="${MODEL:-$ROOT/models/DeepSeek-V4-Flash-Vision-Exp-UD-Q4_K_XL-0000
 export CTX_SIZE=${CTX_SIZE:-65536}
 export GGML_HIP_SPARSE_FA=${GGML_HIP_SPARSE_FA:-1}
 case "$GGML_HIP_SPARSE_FA" in 0|1) ;; *) echo 'GGML_HIP_SPARSE_FA must be 0 or 1.' >&2; exit 1;; esac
+export GGML_HIP_PREFILL_FA=${GGML_HIP_PREFILL_FA:-2}
+case "$GGML_HIP_PREFILL_FA" in 0|1|2) ;; *) echo 'GGML_HIP_PREFILL_FA must be 0, 1 or 2.' >&2; exit 1;; esac
 export GGML_CUDA_MOE_CACHE=0
 export DSV4F_CPU_THREADS=${DSV4F_CPU_THREADS:-12}
 export DSV4F_VRAM_HEADROOM_MIB=${DSV4F_VRAM_HEADROOM_MIB:-512}

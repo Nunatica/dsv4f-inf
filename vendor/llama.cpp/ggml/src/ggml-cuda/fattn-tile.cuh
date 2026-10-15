@@ -788,7 +788,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
     }
 }
 
-template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap> // D == head size
+template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool skip_masked = false> // D == head size
 __launch_bounds__(ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_tile_get_occupancy(DKQ, DV, ncols1*ncols2))
 static __global__ void flash_attn_tile(
         const char * Q_ptr,
@@ -971,6 +971,23 @@ static __global__ void flash_attn_tile(
     } else {
         // Branch without out-of-bounds checks.
         for (int k_VKQ_0 = blockIdx.y*nbatch_fa; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nbatch_fa) {
+            if constexpr (skip_masked) {
+                // Each query shares its mask across the grouped heads. Only
+                // skip exact -inf: finite biases, NaNs and +inf retain the
+                // ordinary path. All threads must take the same branch.
+                bool live = false;
+                const int tid = threadIdx.y*warp_size + threadIdx.x;
+                for (int l = tid; l < ncols1*nbatch_fa; l += nwarps*warp_size) {
+                    const int j = col_Q_0 + l/nbatch_fa;
+                    const int i = k_VKQ_0 + l%nbatch_fa;
+                    if (j < int(ne01.z) && i < k_VKQ_max) {
+                        live |= __half_as_ushort(maskh[j*stride_mask + i]) != 0xfc00;
+                    }
+                }
+                if (!__syncthreads_or(live)) {
+                    continue;
+                }
+            }
             constexpr bool oob_check = false;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
