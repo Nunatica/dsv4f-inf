@@ -5,8 +5,8 @@ Almost fully vibe-coded, highly experimental inference engine for DeepSeek V4 Fl
 9900x (or any zen5 cpus such as 9800x3d) + 192GiB ddr5 5600mhz + 7900xtx (or nvidia gpus such 3090, 4090 which has at least 24gb vram, not tested)
 
 ## Target model
-- main [https://huggingface.co/unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF/tree/main/UD-Q4_K_XL]
-- mtp [https://huggingface.co/ddh0/DeepSeek-V4-Flash-GGUF/tree/a79b345f46fad371767f6a57cc3be31f28e41205]
+- [main model](https://huggingface.co/unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF/tree/main/UD-Q4_K_XL)
+- [mtp drafter](https://huggingface.co/ddh0/DeepSeek-V4-Flash-GGUF/tree/a79b345f46fad371767f6a57cc3be31f28e41205)
 
 ## Dependencies and setup
 
@@ -94,9 +94,9 @@ For access from another device on your LAN, open `http://<server-local-ip>:8080`
 Data was measured at target system. test was done with same prompt with PROMPT_TEST.md
 
 ## Credits
-- llama.cpp [https://github.com/ggml-org/llama.cpp]
-- Strata [https://github.com/Niko1221/Strata]
-- project-maya [https://github.com/mw00/project-maya]
+- [llama.cpp](https://github.com/ggml-org/llama.cpp)
+- [Strata](https://github.com/Niko1221/Strata)
+- [project-maya](https://github.com/mw00/project-maya)
 
 ## License
 Project itself is under MIT License. included llama.cpp source follows its own license.
