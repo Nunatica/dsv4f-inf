@@ -84,6 +84,45 @@ Once ready, open `http://localhost:8080`. The default API key is `dummykey`; set
 For access from another device on your LAN, open `http://<server-local-ip>:8080` (for example, `http://192.168.0.64:8080`). The default `HOST=0.0.0.0` listens on all interfaces, and the web UI supports plain HTTP without SSL. Chat IDs use `crypto.getRandomValues()` when `crypto.randomUUID()` is unavailable on HTTP.
 
 ## Performance
+HIP sparse attention is enabled by default in `run-server.sh`. For 512-dimensional
+Q8_0 or FP16 KV caches, it gathers the union of visible rows for up to eight
+queries, converts only selected Q8_0 rows to FP16, and runs the existing HIP tile
+kernel. Shared K/V caches use one gathered buffer. The path requires an explicit
+`n_kv_max` mask bound, at least 2048 source rows, and at least a 2:1 reduction after
+padding the union bound to 256 rows. Other shapes and larger query batches use
+the existing attention path.
+
+Set `GGML_HIP_SPARSE_FA=0` before launching to compare against dense attention;
+`GGML_HIP_SPARSE_FA_DEBUG=1` prints the first selected sparse shape. Restart the
+server after changing these options. To benchmark the repository's test prompt:
+
+```bash
+DSV4F_MTP=0 DSV4F_EXPERT_CACHE_MIB=6324 ./run-server.sh
+# In another terminal:
+python3 scripts/benchmark.py --prompt-file PROMPT_TEST.md --tokens 128 --runs 3 \
+    --warmup-tokens 0 --output logs/prompt-test.json
+```
+
+`ctest --test-dir build -R gpu-sparse-attention-parity --output-on-failure`
+checks sparse versus dense results, including Q8_0/FP16, shared and separate K/V,
+MTP-sized query groups, strided caches, attention sinks, changing masks during
+graph replay, and dense fallback.
+
+Performance comparisons disable MTP with `DSV4F_MTP=0`, as required by
+`AGENTS.md`. Test MTP compatibility separately. Fix the expert cache capacity
+when comparing runs if desktop VRAM usage changes between server starts.
+
+On 2026-10-15, the command above using `PROMPT_TEST.md` (17,778 prompt tokens),
+`cache_prompt=false`, and three runs per mode measured median decode throughput
+of **13.97 → 14.54 tok/s (+4.12%)** with sparse off/on. Median prefill was
+**237.30 → 237.09 tok/s (-0.09%)**. Both modes used 496 expert slots throughout
+prefill and decode. Generated introductory wording varied within the original
+path as well as between modes; the nine complete function names emitted within
+the 128-token output limit matched in all three pairs. The numerical parity
+test passed all 11 cases, including graph replay and MTP-sized query groups.
+These MTP-disabled, fixed-cache figures are separate from the earlier default
+configuration measurements below.
+
 At target system, it reached to 230 tok/s for prefill and 18.93 tok/s for decode.
 For comparison, llama cpp gives you 197 tok/s for prefill and 12.43 tok/s for decode with moe expert cache + mtp.
 Performance test is done with same prompt from PROMPT_TEST.md
