@@ -65,8 +65,10 @@ inline size_t ggml_dsv4f_allocate_cache(char ** slab, size_t stride, size_t max_
         slots = std::min(retry, slots > step ? slots - step : 0);
         std::fprintf(stderr, "[%s] cache allocation retry: %zu slots\n", tag, slots);
     }
+    /*
     std::fprintf(stderr, "[%s] VRAM budget: free=%.0f MiB requested=%.0f MiB actual=%.2f MiB headroom=%.0f MiB guard=%.0f MiB slots=%zu\n",
                  tag, free / 1048576.0, (requested == std::numeric_limits<size_t>::max() ? free : requested) / 1048576.0,
                  (slots * stride) / 1048576.0, headroom / 1048576.0, guard / 1048576.0, slots);
+    */
     return slots;
 }
