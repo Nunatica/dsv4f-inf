@@ -7,6 +7,7 @@ extern "C" void ggml_dsv4f_experts_register();
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
+#include "ggml-cuda/dsv4f-service.cuh"
 #include "ggml-cuda/moe-cache.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
@@ -143,8 +144,16 @@ int ggml_cuda_get_device() {
     return id;
 }
 
+// Physical pool growth normally happens during graph warmup. If an unexpected
+// growth occurs during capture, do not synchronize or mutate the service cache.
+static thread_local bool dsv4f_capturing = false;
+
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
     ggml_cuda_set_device(device);
+    if (!ggml_dsv4f_reserve_vram(device, size, !dsv4f_capturing)) {
+        *ptr = nullptr;
+        return cudaErrorMemoryAllocation;
+    }
     cudaError_t err;
     if (getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr) {
         err = cudaMallocManaged(ptr, size);
@@ -493,6 +502,9 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         ggml_cuda_set_device(device);
         cudaError_t err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
         if (err == cudaErrorMemoryAllocation) {
+            // Pool warmup must establish capacity before capture. A failure
+            // here cannot be recovered with synchronization or cache frees.
+            if (dsv4f_capturing) CUDA_CHECK(err);
             (void)cudaGetLastError();
             const size_t cached_bytes = pool_size;
             GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: alloc of %.2f MiB failed, flushing %.2f MiB of cached buffers and retrying\n",
@@ -589,6 +601,9 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             GGML_ASSERT(pool_size + reserve_size <= CUDA_POOL_VMM_MAX_SIZE);
 
             // allocate more physical memory
+            if (!ggml_dsv4f_reserve_vram(device, reserve_size, !dsv4f_capturing)) {
+                GGML_ABORT("DSV4F VRAM headroom cannot be preserved for VMM pool growth");
+            }
             CUmemAllocationProp prop = {};
             prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
             prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
@@ -4706,6 +4721,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
 
+    // Recheck outside capture even when replay needs no new allocation (for
+    // example after another context or a desktop application consumed VRAM).
+    if (!ggml_dsv4f_reserve_vram(cuda_ctx->device, 0)) return GGML_STATUS_ALLOC_FAILED;
+
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
@@ -4753,9 +4772,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+        dsv4f_capturing = true;
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    dsv4f_capturing = false;
 
     return GGML_STATUS_SUCCESS;
 }

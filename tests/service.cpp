@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <string>
 #include <vector>
 #include <atomic>
 #include <chrono>
@@ -16,6 +17,7 @@
 static ggml_dsv4f_cpu_fn original_cpu;
 static std::atomic<int> delayed{0};
 static bool cached = true;
+static bool pressure_test = false;
 static void delayed_cpu(const ggml_tensor * g,const ggml_tensor * u,const ggml_tensor * d,const float * x,const int32_t * ids,const float * w,int nk,uint64_t hits,float limit,float * out) {
     if(delayed.fetch_sub(1)>0)std::this_thread::sleep_for(std::chrono::milliseconds(2));
     original_cpu(g,u,d,x,ids,w,nk,hits,limit,out);
@@ -43,11 +45,41 @@ static bool check(ggml_backend_t gpu,ggml_backend_t cpu,ggml_type type,ggml_type
     bool ok=true;double worst=0;
     const bool resize_test=cached && type==GGML_TYPE_MXFP4 && dtype==GGML_TYPE_MXFP4;
     uint64_t full_routes=0,full_hits=0,unused=0;
+    uint64_t pressure_routes=0,pressure_hits=0;
     for(int iteration=0;iteration<96;++iteration){
+        if(pressure_test && iteration==84) {
+            ggml_backend_sched_synchronize(scheduler);
+            const char * previous=std::getenv("DSV4F_VRAM_HEADROOM_MIB");
+            const bool had_previous=previous!=nullptr;
+            const std::string saved=previous?previous:"";
+            size_t free,total;ggml_backend_dev_memory(ggml_backend_get_device(gpu),&free,&total);
+            // Deliberately impossible headroom forces the allocator to return
+            // every cache block, including the initial region, then reject the
+            // allocation. Exercise replay of the existing graph afterwards.
+            const std::string impossible=std::to_string((total>>20)+1024);
+            setenv("DSV4F_VRAM_HEADROOM_MIB",impossible.c_str(),1);
+            auto * rejected=ggml_backend_alloc_buffer(gpu,1<<20);
+            ok &= rejected==nullptr;
+            if(rejected)ggml_backend_buffer_free(rejected);
+            if(had_previous)setenv("DSV4F_VRAM_HEADROOM_MIB",saved.c_str(),1);
+            else unsetenv("DSV4F_VRAM_HEADROOM_MIB");
+            ggml_dsv4f_experts.gpu_statistics(&pressure_routes,&pressure_hits,&unused);
+        }
+        if(pressure_test && iteration==90) {
+            ggml_backend_sched_synchronize(scheduler);
+            uint64_t r,h;ggml_dsv4f_experts.gpu_statistics(&r,&h,&unused);
+            ok &= r-pressure_routes==uint64_t(6*nk*nt) && h==pressure_hits;
+            // Regrow from zero without discarding the captured graph. The
+            // pointer table and lookup must make its new cache entries usable.
+            if(resize_test) {
+                setenv("DSV4F_EXPERT_CACHE_MIB","16",1);
+                ok &= ggml_dsv4f_experts.gpu_resize(true);
+            }
+        }
         if(resize_test && iteration==24) {
             ggml_backend_sched_synchronize(scheduler);
             ggml_dsv4f_experts.gpu_trim_workspace(gpu);
-            // More than 64 small experts exercises multiple extension blocks.
+            // More than 64 small experts exercises multiple cache blocks.
             setenv("DSV4F_EXPERT_CACHE_MIB","16",1);
             ok &= ggml_dsv4f_experts.gpu_resize(true);
         }
@@ -81,6 +113,7 @@ static bool check(ggml_backend_t gpu,ggml_backend_t cpu,ggml_type type,ggml_type
         ggml_backend_tensor_get(out[0],a.data(),0,ne*nt*sizeof(float));ggml_backend_tensor_get(out[1],b.data(),0,ne*nt*sizeof(float));double error=0,norm=0;for(int i=0;i<ne*nt;++i){error+=(a[i]-b[i])*(a[i]-b[i]);norm+=a[i]*a[i];ok&=std::isfinite(b[i]);}double rel=std::sqrt(error/std::max(norm,1e-20));worst=std::max(worst,rel);ok&=rel<.04;
     }
     uint64_t routes=0,hits=0,admissions=0;ggml_dsv4f_experts.gpu_statistics(&routes,&hits,&admissions);
+    if(pressure_test && resize_test)ok &= hits>pressure_hits;
     const char * policy=std::getenv("DSV4F_CACHE_POLICY");
     const bool conservative=policy && !std::strcmp(policy,"aged");
     // Uniform Q4_K/Q6_K routes need not churn all eight experts with a conservative
@@ -95,6 +128,8 @@ static bool check(ggml_backend_t gpu,ggml_backend_t cpu,ggml_type type,ggml_type
 }
 int main(int argc,char ** argv) {
     cached = argc < 3;
+    pressure_test = argc > 2 && !std::strcmp(argv[2],"pressure");
+    if(pressure_test)cached=true;
     setenv("DSV4F_GPU_SERVICE","1",1);setenv("DSV4F_GPU_WAIT",argc>1?argv[1]:"poll",1);setenv("DSV4F_EXPERT_CACHE_MIB",cached?"1":"0",1);setenv("GGML_CUDA_MOE_CACHE","0",1);
     ggml_backend_load_all();ggml_cpu_init();auto * gpu=ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU,nullptr);auto * cpu=ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU,nullptr);
     if(!gpu||!cpu)return 2;

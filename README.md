@@ -77,6 +77,8 @@ After installing the dependencies, put **all five main-model GGUF shards** and `
 ./run-server.sh
 ```
 
+`DSV4F_VRAM_HEADROOM_MIB` reserves free GPU memory (256 MiB in the launcher, with a 128 MiB minimum). With the default GPU service enabled, both the initial expert cache and decode expansion can yield memory before compute buffers, temporary pools, or resident KV storage grow. Allocation and graph boundaries also preserve an internal guard (`DSV4F_VRAM_GUARD_MIB`, default 256 MiB; 0 disables it) for library workspaces and GPU code loaded on first use. MXFP4 cache entries use a stable GPU pointer table so captured graphs can continue after cache reclamation. If required allocations cannot fit even after returning the cache, the allocation fails instead of consuming the configured reserve.
+
 The launcher requires swap protection: either system swap must already be disabled, or a working systemd user session with cgroup v2 memory control must allow `systemd-run --user --scope -p MemorySwapMax=0` (the launcher applies this automatically). It refuses to start if neither is available. Keep enough free RAM for resident model loading; the initial check requires at least the total main-model file size plus 2 GiB, with additional memory needed for MTP and runtime buffers.
 
 Once ready, open `http://localhost:8080`. The default API key is `dummykey`; set `API_KEY`, `HOST`, and `PORT` before starting to override the defaults.

@@ -1,4 +1,5 @@
 #include "dsv4f-kv.cuh"
+#include "dsv4f-service.cuh"
 #include "set-rows.cuh"
 #include <memory>
 
@@ -42,6 +43,9 @@ void * ggml_cuda_dsv4f_kv_create(int device, ggml_tensor * host, uint32_t slots)
     const auto err = cudaHostGetDevicePointer((void **) &s->host, host->data, 0);
     if (err != cudaSuccess) {
         GGML_ABORT("KV streaming needs pinned mapped host storage (unset GGML_CUDA_NO_PINNED)");
+    }
+    if (!ggml_dsv4f_reserve_vram(device, ggml_cuda_dsv4f_kv_bytes(s.get()))) {
+        GGML_ABORT("DSV4F VRAM headroom cannot be preserved for resident KV storage");
     }
     CUDA_CHECK(cudaMalloc((void **) &s->cache, s->slots*s->row_bytes));
     CUDA_CHECK(cudaMalloc((void **) &s->map, size_t(s->rows)*s->streams*sizeof(int)));

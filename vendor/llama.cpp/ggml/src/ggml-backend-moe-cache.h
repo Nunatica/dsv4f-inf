@@ -106,8 +106,8 @@ struct ggml_dsv4f_expert_api {
     void (*gpu_compute)(void * cuda_context, struct ggml_tensor *);
     void (*gpu_finalize)(void * cuda_context, struct ggml_tensor *);
     void (*gpu_statistics)(uint64_t * routes, uint64_t * hits, uint64_t * admissions);
-    // Quiescent phase boundaries only: retain the base cache, return/grow its
-    // decode-only extension, and discard backend graphs/temporary allocations.
+    // Quiescent phase boundaries only: return/grow cache blocks according to
+    // available headroom, and discard backend graphs/temporary allocations.
     bool (*gpu_resize)(bool decode);
     void (*gpu_trim_workspace)(ggml_backend_t backend);
 };

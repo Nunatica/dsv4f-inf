@@ -86,7 +86,7 @@ def main():
                     state = {**info, 'pid': child.pid, 'supervisor_pid': os.getpid(), 'url': url,
                              'log': str(logfile), 'command': cmd, 'memory': status,
                              'engine_options': {k: os.environ[k] for k in (
-                                 'DSV4F_CPU_THREADS', 'DSV4F_VRAM_HEADROOM_MIB', 'DSV4F_EXPERT_CACHE_MIB',
+                                 'DSV4F_CPU_THREADS', 'DSV4F_VRAM_HEADROOM_MIB', 'DSV4F_VRAM_GUARD_MIB', 'DSV4F_EXPERT_CACHE_MIB',
                                  'DSV4F_WHOLE_EXPERT', 'DSV4F_BATCH_TRANSFERS', 'DSV4F_GPU_JOIN',
                                  'DSV4F_PINNED_COMPUTE', 'DSV4F_PINNED_WEIGHTS', 'DSV4F_EXPERT_GRAPHS', 'DSV4F_FUSED_HC_MIX',
                                  'DSV4F_KV_RESIDENT', 'DSV4F_MTP', 'MTP_MODEL', 'DSV4F_DRAFT_N_MAX', 'DSV4F_DRAFT_P_MIN',
