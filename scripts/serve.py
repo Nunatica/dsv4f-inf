@@ -95,7 +95,7 @@ def main():
                                  'DSV4F_CPU_AFFINITY', 'DSV4F_CPU_SCHEDULE', 'DSV4F_CPU_ROW_CHUNK', 'DSV4F_CPU_MXFP4_ROWS',
                                  'DSV4F_CPU_MXFP4_ISA',
                                  'DSV4F_HC_POST_FULL',
-                                 'DSV4F_PREFILL_STREAM', 'DSV4F_PREFILL_GROUP', 'DSV4F_PREFILL_PROFILE',
+                                 'DSV4F_PREFILL_STREAM', 'DSV4F_PREFILL_GROUP', 'DSV4F_PREFILL_CACHE', 'DSV4F_PREFILL_CACHE_MIN_TOKENS', 'DSV4F_PREFILL_PROFILE',
                                  'DSV4F_PHASE_WORKSPACE', 'DSV4F_DECODE_BATCH', 'DSV4F_DECODE_UBATCH',
                                  'DSV4F_CACHE_POLICY', 'DSV4F_CACHE_DECAY_TOKENS', 'DSV4F_CACHE_REPLACE_RATIO', 'DSV4F_CACHE_TRACE',
                                  'DSV4F_PROFILE', 'DSV4F_SCHED_SUMMARY', 'GGML_CUDA_DISABLE_GRAPHS',

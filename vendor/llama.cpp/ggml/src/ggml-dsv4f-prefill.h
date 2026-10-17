@@ -9,7 +9,7 @@
 // cache is sized. No unbudgeted device allocations are made by the copy stream.
 struct ggml_dsv4f_prefill_layout {
     static constexpr int ring = 2;
-    size_t size = 0, stage, gate, up, down, xq, hq, inverse, identity, bounds;
+    size_t size = 0, stage, gate, up, down, xq, hq, inverse, identity, bounds, expert_ptrs;
     size_t stage_stride, gbytes, ubytes, dbytes;
     size_t take(size_t bytes) {
         const size_t off = size;
@@ -34,6 +34,7 @@ struct ggml_dsv4f_prefill_layout {
         inverse = take(rows * sizeof(int32_t));
         identity = take((rows + 128) * sizeof(int32_t));
         bounds = take((g->ne[2] + 1) * sizeof(int32_t));
+        expert_ptrs = take(g->ne[2] * sizeof(void *));
     }
 };
 

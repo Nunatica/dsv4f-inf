@@ -111,9 +111,19 @@ static bool check(ggml_backend_t gpu,ggml_backend_t cpu,ggml_type type,ggml_type
             w[t*nk+j]=float(j+1)/6;}
         for(int k=0;k<2;++k){ggml_backend_tensor_set(x[k],input.data(),0,ne*nt*sizeof(float));ggml_backend_tensor_set(ids[k],selected.data(),0,selected.size()*sizeof(int));ggml_backend_tensor_set(prob[k],w.data(),0,w.size()*sizeof(float));if((k?ggml_backend_sched_graph_compute(scheduler,graph[k]):ggml_backend_graph_compute(cpu,graph[k]))!=GGML_STATUS_SUCCESS)ok=false;}
         ggml_backend_tensor_get(out[0],a.data(),0,ne*nt*sizeof(float));ggml_backend_tensor_get(out[1],b.data(),0,ne*nt*sizeof(float));double error=0,norm=0;for(int i=0;i<ne*nt;++i){error+=(a[i]-b[i])*(a[i]-b[i]);norm+=a[i]*a[i];ok&=std::isfinite(b[i]);}double rel=std::sqrt(error/std::max(norm,1e-20));worst=std::max(worst,rel);ok&=rel<.04;
+        if(pressure_test && resize_test && iteration>=90) {
+            // Regrowth admits weights asynchronously. Tiny synthetic requests
+            // can all finish before the loader is scheduled. Drain admission
+            // between these six replays before asserting a restored cache hit;
+            // keep the existing graph and cache capacity throughout.
+            ok &= ggml_dsv4f_experts.gpu_resize(true);
+        }
     }
     uint64_t routes=0,hits=0,admissions=0;ggml_dsv4f_experts.gpu_statistics(&routes,&hits,&admissions);
-    if(pressure_test && resize_test)ok &= hits>pressure_hits;
+    if(pressure_test && resize_test) {
+        if(hits<=pressure_hits)std::fprintf(stderr,"headroom regrow checkpoint: hits=%llu before=%llu admissions=%llu\n",(unsigned long long)hits,(unsigned long long)pressure_hits,(unsigned long long)admissions);
+        ok &= hits>pressure_hits;
+    }
     const char * policy=std::getenv("DSV4F_CACHE_POLICY");
     const bool conservative=policy && !std::strcmp(policy,"aged");
     // Uniform Q4_K/Q6_K routes need not churn all eight experts with a conservative

@@ -1,4 +1,5 @@
 #include "dsv4f-prefill.cuh"
+#include "dsv4f-service.cuh"
 #include "../ggml-dsv4f-prefill.h"
 #include "../ggml-backend-moe-cache.h"
 #include "mmq.cuh"
@@ -66,7 +67,8 @@ __global__ void combine(const float * sorted, const int32_t * inverse, const flo
 
 void product(ggml_backend_cuda_context & ctx, const void * w, const void * q, float * out,
              const int32_t * identity, const int32_t * bounds, int experts, int max_rows,
-             int total_rows, int cols, int rows, size_t stride) {
+             int total_rows, int cols, int rows, size_t stride,
+             const char * const * expert_ptrs = nullptr, size_t expert_offset = 0) {
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     int best = 0, tiles = INT_MAX;
     for (int j = 8; j <= 128 && tiles > 1; j += 8) {
@@ -80,7 +82,7 @@ void product(ggml_backend_cuda_context & ctx, const void * w, const void * q, fl
         (const char *) w, GGML_TYPE_MXFP4, (const int *) q, identity, bounds, out, nullptr,
         cols, rows, total_rows, cols / QK_MXFP4, total_rows, rows,
         experts, experts, int64_t(stride / sizeof(block_mxfp4)), 0, 0,
-        1, 1, 0, 0, 0, max_rows, best
+        1, 1, 0, 0, 0, max_rows, best, expert_ptrs, expert_offset
     };
     mul_mat_q_case<GGML_TYPE_MXFP4, GGML_PREC_Q8>(ctx, args, ctx.stream());
 }
@@ -138,8 +140,26 @@ void ggml_cuda_dsv4f_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * node
     CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
     std::vector<int> counts(nex, 0), active;
     for (int i = 0; i < nr; ++i) { GGML_ASSERT(hids[i] >= 0 && hids[i] < nex); ++counts[hids[i]]; }
+    for (int e = 0; e < nex; ++e) if (counts[e]) active.push_back(e);
+    ggml_dsv4f_prefill_cache_plan cache_plan;
+    const char * cache_env = std::getenv("DSV4F_PREFILL_CACHE");
+    const char * min_env = std::getenv("DSV4F_PREFILL_CACHE_MIN_TOKENS");
+    const int min_tokens = min_env ? std::max(1, std::atoi(min_env)) : 4096;
+    const bool cached = cache_env && std::atoi(cache_env) != 0 && nt >= min_tokens && ctx.device == 0 &&
+        ggml_dsv4f_prefill_cache_begin(g, u, d, nk, group, active, cache_plan);
+    auto ** expert_ptrs = (const char **) (scratch+layout.expert_ptrs);
+    if (cached) {
+        // Synchronous metadata copy: vector storage may be destroyed on return.
+        CUDA_CHECK(cudaMemcpy(expert_ptrs, cache_plan.experts.data(), active.size()*sizeof(char *), cudaMemcpyHostToDevice));
+        static bool announced_cache = false;
+        if (!announced_cache) {
+            std::fprintf(stderr, "[dsv4f-prefill-cache] enabled min_tokens=%d hits=%d borrowed=%d direct MMQ pointers\n",
+                         min_tokens, cache_plan.hits, cache_plan.borrowed);
+            announced_cache = true;
+        }
+    }
     hbounds[0] = 0;
-    for (int e = 0; e < nex; ++e) if (counts[e]) { active.push_back(e); hbounds[active.size()] = hbounds[active.size()-1]+counts[e]; }
+    for (size_t i = 0; i < active.size(); ++i) hbounds[i+1] = hbounds[i]+counts[active[i]];
     std::vector<int> cursor(nex);
     for (size_t e = 0; e < active.size(); ++e) cursor[active[e]] = hbounds[e];
     for (int i = 0; i < nr; ++i) hinv[i] = cursor[hids[i]]++;
@@ -157,6 +177,22 @@ void ggml_cuda_dsv4f_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * node
         const int slot = gi%2, first = gi*group, count = std::min(group, int(active.size())-first);
         char * stage = scratch+layout.stage+slot*layout.stage_stride;
         if (gi >= 2) CUDA_CHECK(cudaStreamWaitEvent(state.copy, state.used[slot], 0));
+        if (cached) {
+            for (int j = 0; j < count; ++j) {
+                if (cache_plan.resident[first+j]) continue;
+                char * target = const_cast<char *>(cache_plan.experts[first+j]);
+                const int expert = active[first+j];
+                CUDA_CHECK(cudaMemcpyAsync(target, (const char *) g->data+expert*layout.gbytes,
+                    layout.gbytes, cudaMemcpyHostToDevice, state.copy));
+                CUDA_CHECK(cudaMemcpyAsync(target+cache_plan.up_offset, (const char *) u->data+expert*layout.ubytes,
+                    layout.ubytes, cudaMemcpyHostToDevice, state.copy));
+                CUDA_CHECK(cudaMemcpyAsync(target+cache_plan.down_offset, (const char *) d->data+expert*layout.dbytes,
+                    layout.dbytes, cudaMemcpyHostToDevice, state.copy));
+                copied += layout.gbytes+layout.ubytes+layout.dbytes;
+            }
+            CUDA_CHECK(cudaEventRecord(state.ready[slot], state.copy));
+            return;
+        }
         const ggml_tensor * tensors[] = {g, u, d};
         size_t offset = 0;
         for (const auto * tensor : tensors) {
@@ -184,8 +220,8 @@ void ggml_cuda_dsv4f_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * node
         for (int j = 0; j < count; ++j) max_rows = std::max(max_rows, counts[active[first+j]]);
         const char * stage = scratch+layout.stage+slot*layout.stage_stride;
         CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), state.ready[slot], 0));
-        product(ctx, stage, xq, gate, identity, bounds+first, count, max_rows, nr, ne, nf, layout.gbytes);
-        product(ctx, stage+group*layout.gbytes, xq, up, identity, bounds+first, count, max_rows, nr, ne, nf, layout.ubytes);
+        product(ctx, stage, xq, gate, identity, bounds+first, count, max_rows, nr, ne, nf, layout.gbytes, cached ? expert_ptrs+first : nullptr);
+        product(ctx, stage+group*layout.gbytes, xq, up, identity, bounds+first, count, max_rows, nr, ne, nf, layout.ubytes, cached ? expert_ptrs+first : nullptr, cache_plan.up_offset);
         activate<<<(int64_t(rows)*nf+255)/256, 256, 0, ctx.stream()>>>(gate, up, int64_t(r0)*nf, int64_t(rows)*nf, limit);
         // MMQ stores [K block][sorted row], not independent row-major byte
         // strings. Scatter this group's hidden rows using the full-layer row
@@ -193,7 +229,7 @@ void ggml_cuda_dsv4f_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * node
         quantize_scatter_mmq_q8_1_cuda(gate+int64_t(r0)*nf, identity+r0, hq, d->type,
                                      nf, nf, GGML_PAD(nf, 512), rows, nr, 1, ctx.stream());
         product(ctx, stage+group*(layout.gbytes+layout.ubytes), hq, down, identity, bounds+first,
-                count, max_rows, nr, nf, ne, layout.dbytes);
+                count, max_rows, nr, nf, ne, layout.dbytes, cached ? expert_ptrs+first : nullptr, cache_plan.down_offset);
         CUDA_CHECK(cudaEventRecord(state.used[slot], ctx.stream()));
         if (gi+2 < groups) upload(gi+2);
     }
@@ -202,10 +238,11 @@ void ggml_cuda_dsv4f_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * node
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaEventRecord(state.done, ctx.stream()));
     state.pending = true;
+    if (cached) ggml_dsv4f_prefill_cache_end(ctx.stream());
     if (std::getenv("DSV4F_PREFILL_PROFILE")) {
         CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-start).count();
-        std::fprintf(stderr, "[dsv4f-prefill] layer=%s tokens=%d experts=%zu groups=%d h2d_mib=%.2f wall_ms=%.3f\n",
-                     g->name, nt, active.size(), groups, copied/1048576., ms);
+        std::fprintf(stderr, "[dsv4f-prefill] layer=%s tokens=%d experts=%zu groups=%d h2d_mib=%.2f wall_ms=%.3f cache=%d hits=%d borrowed=%d\n",
+                     g->name, nt, active.size(), groups, copied/1048576., ms, cached, cache_plan.hits, cache_plan.borrowed);
     }
 }

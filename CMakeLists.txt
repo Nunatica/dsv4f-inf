@@ -38,6 +38,11 @@ target_include_directories(dsv4f-prefill-test PRIVATE src vendor/llama.cpp/ggml/
 target_link_libraries(dsv4f-prefill-test PRIVATE ggml ggml-cpu)
 add_test(NAME gpu-streamed-prefill-parity COMMAND dsv4f-prefill-test)
 set_tests_properties(gpu-streamed-prefill-parity PROPERTIES TIMEOUT 180)
+foreach(mode IN ITEMS cache zero-cache threshold)
+    add_test(NAME gpu-prefill-${mode}-parity COMMAND dsv4f-prefill-test ${mode})
+    set_tests_properties(gpu-prefill-${mode}-parity PROPERTIES
+        ENVIRONMENT "DSV4F_PREFILL_PROFILE=1" TIMEOUT 240)
+endforeach()
 add_executable(dsv4f-budget-test tests/budget.cpp)
 target_include_directories(dsv4f-budget-test PRIVATE vendor/llama.cpp/ggml/src)
 add_test(NAME vram-cache-budget COMMAND dsv4f-budget-test)

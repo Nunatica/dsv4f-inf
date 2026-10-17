@@ -96,6 +96,18 @@ __global__ void reserve_slot(int * readers,int * table,int slot,int old_key,int 
 __global__ void publish_slot(int * readers,int * table,int slot,int key) {
     if(threadIdx.x)return;__threadfence();atomicExch(readers+slot,0);atomicExch(table+key,slot);
 }
+__global__ void prefill_lease(int * readers, int * table, const int * updates, int count, bool publish) {
+    const int i = blockIdx.x*blockDim.x+threadIdx.x;
+    if (i >= count) return;
+    const int slot = updates[3*i], old_key = updates[3*i+1], new_key = updates[3*i+2];
+    if (publish) {
+        atomicExch(readers+slot, 0);
+        if (new_key >= 0) atomicExch(table+new_key, slot);
+    } else {
+        if (old_key >= 0) atomicCAS(table+old_key, slot, -1);
+        atomicExch(readers+slot, -1);
+    }
+}
 // MXFP4 tile epilogues: no F32 hidden spill, no per-expert down output spill.
 __global__ void mxfp4_gu(const char * const * cache,size_t up_offset,const int32_t * plan,
                         const block_q8_1 * xq,block_q8_1 * hq,int ne,int nf,float limit) {
@@ -147,6 +159,9 @@ class service {
     request * host=nullptr,*device=nullptr;
     unsigned long long * seq=nullptr,*issued=nullptr;
     int * table=nullptr,*readers=nullptr,*claim_h=nullptr,*claim_d=nullptr;
+    int * prefill_updates=nullptr;
+    std::vector<int> prefill_changes;
+    bool prefill_leased=false;
     char * slab=nullptr;
     char ** extra=nullptr;
     struct cache_block { char * data; size_t count; };
@@ -271,7 +286,7 @@ class service {
         const size_t scratch=5*sizeof(unsigned long long)+MAX_LAYERS*MAX_EXPERTS*sizeof(int)+
             MAX_USED*(size_t(nf+ne+1)*sizeof(float)+sizeof(int32_t))+
             (GGML_PAD(ne,MATRIX_ROW_PADDING)+MAX_USED*GGML_PAD(nf,MATRIX_ROW_PADDING))/QK8_1*sizeof(block_q8_1)+
-            43*g->ne[2]*(sizeof(char *)+sizeof(int));
+            43*g->ne[2]*(sizeof(char *)+4*sizeof(int));
         if(!ggml_dsv4f_reserve_vram(0,scratch))throw std::runtime_error("DSV4F VRAM headroom cannot be preserved for service scratch");
         CUDA_CHECK(cudaHostAlloc((void**)&host,RING*sizeof(request),cudaHostAllocMapped));std::memset(host,0,RING*sizeof(request));CUDA_CHECK(cudaHostGetDevicePointer((void**)&device,host,0));
         CUDA_CHECK(cudaMalloc((void**)&issued,4*sizeof(unsigned long long)));
@@ -283,6 +298,7 @@ class service {
         CUDA_CHECK(cudaMalloc(&hq,MAX_USED*GGML_PAD(nf,MATRIX_ROW_PADDING)/QK8_1*sizeof(block_q8_1)));
         CUDA_CHECK(cudaHostAlloc((void**)&claim_h,sizeof(int),cudaHostAllocMapped));CUDA_CHECK(cudaHostGetDevicePointer((void**)&claim_d,claim_h,0));
         max_slots=43*g->ne[2];
+        CUDA_CHECK(cudaMalloc((void**)&prefill_updates,3*max_slots*sizeof(int)));
         CUDA_CHECK(cudaMalloc((void**)&extra,max_slots*sizeof(char *)));
         CUDA_CHECK(cudaMalloc((void**)&readers,max_slots*sizeof(int)));CUDA_CHECK(cudaMemset(readers,0xff,max_slots*sizeof(int)));
         int count;
@@ -366,6 +382,9 @@ public:
         if(trace){std::fprintf(trace,"S %d %zu\n",base_slots,slots.size());std::fflush(trace);}
     }
     size_t reclaim(size_t bytes) {
+        // MMQ can grow its temporary pool while the custom op owns cache slots.
+        // Do not surrender weights before all three projections have retired.
+        if(prefill_leased)return 0;
         if(!host || slots.empty() || !bytes)return 0;
         ggml_cuda_set_device(0);drain();
         std::unique_lock<std::mutex> lock(mutex);
@@ -426,6 +445,8 @@ public:
     void clear() {
         if(!host){configured=false;selected_source=nullptr;return;}ggml_cuda_set_device(0);CUDA_CHECK(cudaDeviceSynchronize());stop.store(true,std::memory_order_release);copies.notify_all();answered.notify_all();worker.join();loader.join();
         for(auto block:cache_blocks)CUDA_CHECK(cudaFree(block.data));cache_blocks.clear();cache_ptrs.clear();
+        CUDA_CHECK(cudaFree(prefill_updates));prefill_updates=nullptr;
+        prefill_changes.clear();prefill_leased=false;
         cudaFree(extra);cudaFree(slab);cudaFree(seq);cudaFree(issued);cudaFree(table);cudaFree(readers);cudaFree(gate);cudaFree(down);cudaFree(weights);cudaFree(plan);cudaFree(aq);cudaFree(hq);cudaFreeHost(host);cudaFreeHost(claim_h);cudaStreamDestroy(copy);
         if(trace){std::fclose(trace);trace=nullptr;}
         configured=false;selected_source=nullptr;host=device=nullptr;slab=nullptr;extra=nullptr;base_slots=max_slots=0;layers.clear();layer_ids.clear();policy.clear();pending.clear();queue.clear();routes=hits=admissions=admit_bytes=requests=0;cpu_ms=0;
@@ -434,6 +455,82 @@ public:
         const uintptr_t lo=(uintptr_t)base,hi=lo+bytes;bool found=selected_source && (uintptr_t)selected_source>=lo && (uintptr_t)selected_source<hi;
         {std::lock_guard<std::mutex> lock(mutex);for(const auto & l:layers)for(const void * p:{l.g.data,l.u.data,l.d.data})if((uintptr_t)p>=lo && (uintptr_t)p<hi)found=true;}
         if(found)clear();
+    }
+    bool prefill_begin(const ggml_tensor * g, const ggml_tensor * u, const ggml_tensor * d,
+                       int nk, int group, std::vector<int> & active, ggml_dsv4f_prefill_cache_plan & output) {
+        const char * enabled=std::getenv("DSV4F_GPU_SERVICE");
+        if(!enabled || !std::atoi(enabled) || nk>8 || g->ne[0]>MAX_EMBD ||
+           !compatible(g,u,d,nk))return false;
+        init(g,u,d,nk);
+        if(!fused_mxfp4 || cache_ptrs.empty())return false;
+        // The service's background admission must retire before borrowing its
+        // slots. Once leased, host policy and GPU readers both exclude them.
+        drain();
+        std::unique_lock<std::mutex> lock(mutex);
+        copies.wait(lock,[&]{return pending.empty();});
+        CUDA_CHECK(cudaStreamSynchronize(copy));
+        GGML_ASSERT(!prefill_leased);
+        int layer;
+        auto found=layer_ids.find(g->data);
+        if(found==layer_ids.end()) {
+            layer=layers.size();GGML_ASSERT(layer<MAX_LAYERS);
+            layers.push_back({*g,*u,*d});layer_ids[g->data]=layer;
+        } else layer=found->second;
+        std::vector<int> location(g->ne[2],-1);
+        for(size_t i=0;i<slots.size();++i) {
+            const int key=slots[i].key;
+            if(slots[i].ready && key/MAX_EXPERTS==layer && key>=0 && key%MAX_EXPERTS<g->ne[2])
+                location[key%MAX_EXPERTS]=i;
+        }
+        std::vector<int> ordered=active;
+        std::stable_partition(ordered.begin(),ordered.end(),[&](int e){return location[e]>=0;});
+        int nhits=0;for(int e:ordered)nhits+=location[e]>=0;
+        std::vector<bool> pinned(slots.size(),false);
+        for(int e:ordered)if(location[e]>=0)pinned[location[e]]=true;
+        // Only ring positions actually used by misses need replacement slots.
+        std::vector<int> ring(2*group,-1),final_key(2*group,-1),victims;
+        for(size_t i=nhits;i<ordered.size();++i)final_key[i%(2*group)]=layer*MAX_EXPERTS+ordered[i];
+        int needed=0;for(int key:final_key)needed+=key>=0;
+        for(size_t i=0;i<slots.size();++i)if(!pinned[i] && slots[i].ready)victims.push_back(i);
+        if(int(victims.size())<needed)return false;
+        std::stable_sort(victims.begin(),victims.end(),[&](int a,int b) {
+            const bool empty_a=slots[a].key<0,empty_b=slots[b].key<0;
+            return empty_a!=empty_b?empty_a:policy.score(slots[a].key)<policy.score(slots[b].key);
+        });
+        prefill_changes.clear();
+        auto lease=[&](int index,int key) {
+            prefill_changes.insert(prefill_changes.end(),{index,slots[index].key,key});
+            slots[index].ready=false;
+        };
+        int next=0;
+        for(int i=0;i<2*group;++i)if(final_key[i]>=0) {
+            ring[i]=victims[next++];lease(ring[i],final_key[i]);
+        }
+        output={};output.hits=nhits;output.borrowed=needed;
+        output.up_offset=uo;output.down_offset=doff;
+        for(size_t i=0;i<ordered.size();++i) {
+            const int hit=location[ordered[i]];
+            if(hit>=0)lease(hit,layer*MAX_EXPERTS+ordered[i]);
+            output.resident.push_back(hit>=0);
+            output.experts.push_back(cache_ptrs[hit>=0?hit:ring[i%(2*group)]]);
+        }
+        active=std::move(ordered);
+        prefill_leased=true;
+        CUDA_CHECK(cudaMemcpy(prefill_updates,prefill_changes.data(),prefill_changes.size()*sizeof(int),cudaMemcpyHostToDevice));
+        prefill_lease<<<(prefill_changes.size()/3+127)/128,128,0,copy>>>(readers,table,prefill_updates,prefill_changes.size()/3,false);
+        CUDA_CHECK(cudaGetLastError());CUDA_CHECK(cudaStreamSynchronize(copy));
+        return true;
+    }
+    void prefill_end(cudaStream_t stream) {
+        GGML_ASSERT(prefill_leased);
+        // Complete the layer before handing its borrowed slots back to decode
+        // admission, memory reclamation, graph capture, or another backend.
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::lock_guard<std::mutex> lock(mutex);
+        for(size_t i=0;i<prefill_changes.size();i+=3)policy.publish(prefill_changes[i],prefill_changes[i+2]);
+        prefill_lease<<<(prefill_changes.size()/3+127)/128,128,0,copy>>>(readers,table,prefill_updates,prefill_changes.size()/3,true);
+        CUDA_CHECK(cudaGetLastError());CUDA_CHECK(cudaStreamSynchronize(copy));
+        prefill_changes.clear();prefill_leased=false;
     }
     void enqueue_one(ggml_backend_cuda_context & ctx,ggml_tensor * dst,int token_index) {
         const auto * g=dst->src[3],*u=dst->src[4],*d=dst->src[5];init(g,u,d,dst->src[1]->ne[0]);
@@ -506,6 +603,11 @@ void ggml_dsv4f_service_invalidate(const void * base,size_t bytes){instance().in
 
 void ggml_dsv4f_service_statistics(uint64_t * r,uint64_t * h,uint64_t * a){instance().statistics(r,h,a);}
 bool ggml_dsv4f_service_resize(bool decode){return instance().resize(decode);}
+bool ggml_dsv4f_prefill_cache_begin(const ggml_tensor * g, const ggml_tensor * u,
+    const ggml_tensor * d, int nk, int group, std::vector<int> & active,
+    ggml_dsv4f_prefill_cache_plan & plan) {return instance().prefill_begin(g,u,d,nk,group,active,plan);}
+void ggml_dsv4f_prefill_cache_end(cudaStream_t stream) {instance().prefill_end(stream);}
+
 
 bool ggml_dsv4f_reserve_vram(int device,size_t bytes,bool allow_reclaim) {
     const char * enabled=std::getenv("DSV4F_GPU_SERVICE");

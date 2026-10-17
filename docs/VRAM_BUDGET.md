@@ -1,3 +1,19 @@
-`DSV4F_EXPERT_CACHE_MIB` specifies the memory budget allocated for the MoE experts loaded onto the GPU. This variable does not operate in isolation; instead, it works in conjunction with DSV4F_VRAM_HEADROOM_MIB and DSV4F_VRAM_GUARD_MIB.
-`DSV4F_VRAM_HEADROOM_MIB` reserves free GPU memory (256 MiB in the launcher, with a 128 MiB minimum). With the default GPU service enabled, both the initial expert cache and decode expansion can yield memory before compute buffers, temporary pools, or resident KV storage grow. Allocation and graph boundaries also preserve an internal guard by `DSV4F_VRAM_GUARD_MIB` (default 256 MiB; 0 disables it) for library workspaces and GPU code loaded on first use. MXFP4 cache entries use a stable GPU pointer table so captured graphs can continue after cache reclamation. If required allocations cannot fit even after returning the cache, the allocation fails instead of consuming the configured reserve.
+# VRAM Budget
 
+## Configuration
+
+The GPU expert cache budget works together with two settings that reserve free GPU memory:
+
+| Environment variable | Purpose | Default / minimum |
+| --- | --- | --- |
+| `DSV4F_EXPERT_CACHE_MIB` | Sets the memory budget for MoE experts cached on the GPU. | — |
+| `DSV4F_VRAM_HEADROOM_MIB` | Reserves free GPU memory. | 256 MiB in the launcher; minimum 128 MiB. |
+| `DSV4F_VRAM_GUARD_MIB` | Preserves an internal memory guard at allocation and graph boundaries for library workspaces and GPU code loaded on first use. | 256 MiB; set to `0` to disable. |
+
+## Memory Reclamation
+
+With the default GPU service enabled, memory can be reclaimed from both the initial expert cache and cache expansions made during decoding. This allows compute buffers, temporary pools, and resident KV storage to grow while preserving the configured memory reserve.
+
+MXFP4 cache entries use a stable GPU pointer table, allowing captured graphs to continue running after cache memory is reclaimed.
+
+If a required allocation still cannot fit after reclaiming the cache, the allocation fails rather than consuming the configured reserve.

@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -90,19 +91,64 @@ static bool check(ggml_backend_t gpu, ggml_backend_t cpu, int nt, float limit, i
         for(size_t i=0;i<a.size();++i){error+=double(a[i]-b[i])*(a[i]-b[i]);norm+=double(a[i])*a[i];ok&=std::isfinite(b[i]);}
         const double rel=std::sqrt(error/std::max(norm,1e-20));worst=std::max(worst,rel);ok&=rel<.003;
     }
+    if(depth==1 && std::getenv("DSV4F_GPU_SERVICE")) {
+        // Return leased slots to the ordinary decode kernels, including GPU
+        // table lookups and admission. Compare with token zero of the reference.
+        auto * dc=ggml_init({2*1024*1024,nullptr,true});
+        auto * dx=ggml_new_tensor_2d(dc,GGML_TYPE_F32,ne,1);
+        auto * di=ggml_new_tensor_2d(dc,GGML_TYPE_I32,nk,1);
+        auto * dw=ggml_new_tensor_3d(dc,GGML_TYPE_F32,1,nk,1);
+        auto * result=dsv4f_moe(dc,dx,di,dw,g,u,d,limit);
+        auto * graph=ggml_new_graph(dc);ggml_build_forward_expand(graph,result);
+        auto * ds=ggml_backend_sched_new(backends,nullptr,2,1024,false,true);
+        ggml_set_input(dx);ggml_set_input(di);ggml_set_input(dw);ggml_set_output(result);
+        ok&=ggml_backend_sched_alloc_graph(ds,graph);
+        ggml_backend_tensor_set(dx,input.data(),0,ne*sizeof(float));
+        ggml_backend_tensor_set(di,selected.data(),0,nk*sizeof(int32_t));
+        ggml_backend_tensor_set(dw,weights.data(),0,nk*sizeof(float));
+        ok&=ggml_backend_sched_graph_compute(ds,graph)==GGML_STATUS_SUCCESS;
+        std::vector<float> decoded(ne);ggml_backend_tensor_get(result,decoded.data(),0,ne*sizeof(float));
+        double error=0,norm=0;
+        for(int i=0;i<ne;++i){error+=double(a[i]-decoded[i])*(a[i]-decoded[i]);norm+=double(a[i])*a[i];ok&=std::isfinite(decoded[i]);}
+        const double rel=std::sqrt(error/std::max(norm,1e-20));ok&=rel<.04;
+        std::printf("Prefill to decode nt=%d relative RMSE=%g %s\n",nt,rel,rel<.04?"PASS":"FAIL");
+        ggml_backend_sched_free(ds);ggml_free(dc);
+    }
     std::printf("Streamed prefill vs GPU MUL_MAT_ID ne=%d nf=%d nt=%d strided_ids clamp=%g worst_rel_rmse=%g %s\n",ne,nf,nt,limit,worst,ok?"PASS":"FAIL");
+    ggml_dsv4f_experts.invalidate(g->data,ggml_nbytes(g));
     ggml_backend_sched_free(sched);
     for(int k=0;k<2;++k){if(buffers[k])ggml_backend_buffer_free(buffers[k]);ggml_free(contexts[k]);}
     ggml_backend_buffer_free(wb);ggml_free(wc);return ok;
 }
 
-int main() {
+int main(int argc, char ** argv) {
+    const bool cached=argc>1;
+    const bool boundary=cached && !std::strcmp(argv[1],"threshold");
+    if(cached) {
+        setenv("DSV4F_GPU_SERVICE","1",1);
+        setenv("DSV4F_EXPERT_CACHE_MIB",!std::strcmp(argv[1],"zero-cache")?"0":"8",1);
+        setenv("DSV4F_PREFILL_CACHE","1",1);
+        setenv("DSV4F_PREFILL_CACHE_MIN_TOKENS",boundary?"4096":"32",1);
+        setenv("DSV4F_PREFILL_GROUP","4",1);
+    }
     setenv("GGML_CUDA_MOE_CACHE","0",1);
     ggml_backend_load_all();ggml_cpu_init();
     auto * gpu=ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU,nullptr);
     auto * cpu=ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU,nullptr);
     if(!gpu||!cpu)return 2;
-    bool ok=true;for(int nt:{32,127,257,2051})for(float limit:{1.25f,INFINITY})ok&=check(gpu,cpu,nt,limit);
-    ok&=check(gpu,cpu,129,1.25f,4096,2048,8);
+    bool ok=true;
+    if(boundary) {
+        for(int nt:{4095,4096})ok&=check(gpu,cpu,nt,1.25f,512,512,9);
+        ggml_backend_free(gpu);ggml_backend_free(cpu);return ok?0:1;
+    }
+    for(int nt:{32,127,257,2051})for(float limit:{1.25f,INFINITY})ok&=check(gpu,cpu,nt,limit);
+    ok&=check(gpu,cpu,129,1.25f,4096,2048,8); // Cache too small: fallback.
+    if(cached) {
+        ok&=check(gpu,cpu,127,1.25f,512,512,8); // Entire active set can hit.
+        if(std::strcmp(argv[1],"zero-cache")) {
+            setenv("DSV4F_EXPERT_CACHE_MIB","128",1);
+            ok&=check(gpu,cpu,129,1.25f,4096,2048,8); // Actual model geometry, direct cache MMQ.
+        }
+    }
     ggml_backend_free(gpu);ggml_backend_free(cpu);return ok?0:1;
 }
