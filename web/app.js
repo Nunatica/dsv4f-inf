@@ -147,8 +147,8 @@ function setView(next) {
     $(`tab-${name}`).classList.toggle('active', name === view);
     if (name === view) $(`tab-${name}`).setAttribute('aria-current', 'page'); else $(`tab-${name}`).removeAttribute('aria-current');
   }
-  $('eyebrow').textContent = view === 'chat' ? 'Conversation' : 'INFERENCE PERFORMANCE';
-  $('page-title').textContent = view === 'chat' ? current().title : 'Performance report';
+  $('eyebrow').textContent = view === 'chat' ? 'Conversation' : 'Report';
+  $('page-title').textContent = view === 'chat' ? current().title : 'Performance';
   history.replaceState(null, '', view === 'report' ? '#report' : '#chat');
   if (view === 'report') renderReport();
   menu(false);

@@ -8,7 +8,7 @@
 <aside id="sidebar" aria-label="Menu">
   <a class="brand" href="#chat"><span class="brand-mark" aria-hidden="true">D</span><span>DeepSeek Flash<small>LOCAL INFERENCE</small></span></a>
   <button id="new-chat" class="primary" type="button">＋ New chat</button>
-  <nav aria-label="Views"><button id="tab-chat" class="nav-button active" type="button" aria-controls="view-chat" aria-current="page"><span aria-hidden="true">◌</span>Chat</button><button id="tab-report" class="nav-button" type="button" aria-controls="view-report"><span aria-hidden="true">▥</span>Performance report</button></nav>
+  <nav aria-label="Views"><button id="tab-chat" class="nav-button active" type="button" aria-controls="view-chat" aria-current="page"><span aria-hidden="true">◌</span>Chat</button><button id="tab-report" class="nav-button" type="button" aria-controls="view-report"><span aria-hidden="true">▥</span>Performance</button></nav>
   <div class="history-heading"><span>Chat history</span><span id="chat-count">0</span></div>
   <input id="search" type="search" placeholder="Search conversations" aria-label="Search conversations" autocomplete="off">
   <div id="chat-list" aria-label="Saved conversations"></div>
@@ -25,11 +25,11 @@
     <form id="form"><label class="sr-only" for="prompt">Message</label><textarea id="prompt" rows="3" placeholder="Type a message…" required></textarea><div class="composer-actions"><label class="attach" for="image">＋ Image<input id="image" type="file" accept="image/*" class="sr-only"></label><span id="attachment-name"></span><button id="remove-image" type="button" hidden aria-label="Remove attached image">×</button><span class="shortcut">Ctrl + Enter to send</span><button id="stop" type="button" hidden>Stop</button><button id="send" class="primary" type="submit" disabled>Send ↑</button></div><div id="error" role="alert"></div></form>
   </section>
   <section id="view-report" aria-labelledby="tab-report" hidden>
-    <div class="report-head"><div><h2>Performance report</h2><p>Actual response measurements recorded in this browser.</p></div><button id="export-report" type="button">Save JSON ↓</button></div>
+    <div class="report-head" style="display: none;"><div><h2>Performance report</h2><p>Actual response measurements recorded in this browser.</p></div><button id="export-report" type="button">Save JSON ↓</button></div>
     <div id="report-cards" class="metric-grid"></div>
     <section class="panel"><h3>Server settings</h3><div id="server-settings" class="settings-grid">Settings will appear when connected to the server.</div></section>
     <section class="panel"><div class="panel-head"><h3>Response measurements</h3><span id="report-count" class="muted"></span></div><div class="table-scroll"><table><thead><tr><th>Conversation / Time</th><th>Status</th><th>Output tokens</th><th>Decoding</th><th>First token</th><th>Total time</th></tr></thead><tbody id="report-rows"></tbody></table></div><p class="note">tok/s uses native decoding measurements from the server. Time to first token and total time are measured by the browser and include network and wait times. Stopped and failed responses are excluded from summary statistics.</p></section>
-    <section class="panel"><div class="panel-head"><h3>Engine benchmark history</h3><span class="badge">Past measurement</span></div><div id="benchmark">Loading measurements…</div></section>
+    <section class="panel" style="display: none;"><div class="panel-head"><h3>Engine benchmark history</h3><span class="badge">Past measurement</span></div><div id="benchmark">Loading measurements…</div></section>
   </section>
 </main>
 <dialog id="settings-panel" aria-labelledby="settings-title">
