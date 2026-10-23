@@ -178,6 +178,7 @@ function selectChat(id) {
   if (busy) return;
   current().draft = $('prompt').value; activeId = id; $('error').textContent = ''; clearImage();
   renderChat(); setView('chat'); renderHistory(); persist();
+  followOutput(true);
 }
 function messageNode(message) {
   const card = make('article', `message ${message.role}`);
