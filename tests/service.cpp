@@ -24,6 +24,9 @@ static void delayed_cpu(const ggml_tensor * g,const ggml_tensor * u,const ggml_t
 }
 static bool check(ggml_backend_t gpu,ggml_backend_t cpu,ggml_type type,ggml_type dtype,int nt=1) {
     constexpr int ne=256,nf=512,experts=8,nk=3;
+    // A preceding pressure case regrows to 16 MiB. Restore this case's initial
+    // capacity so the retained hot set and forced misses are deterministic.
+    setenv("DSV4F_EXPERT_CACHE_MIB",cached?"1":"0",1);
     auto * weights=ggml_init({2*1024*1024,nullptr,true});
     auto * g=ggml_new_tensor_3d(weights,type,ne,nf,experts),*u=ggml_new_tensor_3d(weights,type,ne,nf,experts),*d=ggml_new_tensor_3d(weights,dtype,nf,ne,experts);
     auto * wb=ggml_backend_alloc_ctx_tensors(weights,cpu);ggml_backend_buffer_set_usage(wb,GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
@@ -47,6 +50,8 @@ static bool check(ggml_backend_t gpu,ggml_backend_t cpu,ggml_type type,ggml_type
     uint64_t full_routes=0,full_hits=0,unused=0;
     uint64_t pressure_routes=0,pressure_hits=0;
     for(int iteration=0;iteration<96;++iteration){
+        uint64_t mixed_routes=0,mixed_hits=0;
+        const bool mixed_test=resize_test && nt>1 && iteration==80;
         if(pressure_test && iteration==84) {
             ggml_backend_sched_synchronize(scheduler);
             const char * previous=std::getenv("DSV4F_VRAM_HEADROOM_MIB");
@@ -109,8 +114,26 @@ static bool check(ggml_backend_t gpu,ggml_backend_t cpu,ggml_type type,ggml_type
         std::vector<float> input(ne*nt),a(ne*nt),b(ne*nt);for(auto & v:input)v=normal(rng)*8;std::vector<int> selected(nk*nt);std::vector<float> w(nk*nt);for(int t=0;t<nt;++t)for(int j=0;j<nk;++j){
             selected[t*nk+j]=resize_test && iteration<80?(iteration+t*3+j)%5+(iteration<24?0:3):(iteration+t*3+j*2)%experts;
             w[t*nk+j]=float(j+1)/6;}
+        // All-hit replays after ring reuse must add zero, never an old answer.
+        // Use the same inputs for both the original and no-miss protocols.
+        if(resize_test && (iteration==60 || iteration==61))
+            for(int t=0;t<nt;++t)if(iteration==60 || t%2==0)std::fill_n(w.data()+t*nk,nk,0.f);
+        if(mixed_test) {
+            // Compaction retained experts 3..7. Put a delayed CPU miss before
+            // a trailing all-hit token, so waiting on the newest observation
+            // instead of the last real CPU handle would deadlock the callback.
+            ggml_dsv4f_experts.gpu_statistics(&mixed_routes,&mixed_hits,&unused);
+            for(int t=0;t<nt;++t)for(int j=0;j<nk;++j)selected[t*nk+j]=(t==nt-2?0:3)+j;
+            delayed=1;
+        }
         for(int k=0;k<2;++k){ggml_backend_tensor_set(x[k],input.data(),0,ne*nt*sizeof(float));ggml_backend_tensor_set(ids[k],selected.data(),0,selected.size()*sizeof(int));ggml_backend_tensor_set(prob[k],w.data(),0,w.size()*sizeof(float));if((k?ggml_backend_sched_graph_compute(scheduler,graph[k]):ggml_backend_graph_compute(cpu,graph[k]))!=GGML_STATUS_SUCCESS)ok=false;}
         ggml_backend_tensor_get(out[0],a.data(),0,ne*nt*sizeof(float));ggml_backend_tensor_get(out[1],b.data(),0,ne*nt*sizeof(float));double error=0,norm=0;for(int i=0;i<ne*nt;++i){error+=(a[i]-b[i])*(a[i]-b[i]);norm+=a[i]*a[i];ok&=std::isfinite(b[i]);}double rel=std::sqrt(error/std::max(norm,1e-20));worst=std::max(worst,rel);ok&=rel<.04;
+        if(resize_test && iteration==60)ok &= a==b;
+        if(mixed_test) {
+            ok &= ggml_dsv4f_experts.gpu_resize(false); // retire ordered observations
+            uint64_t r,h;ggml_dsv4f_experts.gpu_statistics(&r,&h,&unused);
+            ok &= r-mixed_routes==uint64_t(nk*nt) && h-mixed_hits==uint64_t(nk*(nt-1));
+        }
         if(pressure_test && resize_test && iteration>=90) {
             // Regrowth admits weights asynchronously. Tiny synthetic requests
             // can all finish before the loader is scheduled. Drain admission
