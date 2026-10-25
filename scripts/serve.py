@@ -90,7 +90,7 @@ def main():
                                  'DSV4F_WHOLE_EXPERT', 'DSV4F_BATCH_TRANSFERS', 'DSV4F_GPU_JOIN',
                                  'DSV4F_PINNED_COMPUTE', 'DSV4F_PINNED_WEIGHTS', 'DSV4F_EXPERT_GRAPHS', 'DSV4F_FUSED_HC_MIX',
                                  'DSV4F_KV_RESIDENT', 'DSV4F_MTP', 'MTP_MODEL', 'DSV4F_DRAFT_N_MAX', 'DSV4F_DRAFT_P_MIN',
-                                 'DSV4F_GPU_SERVICE', 'DSV4F_GPU_WAIT', 'DSV4F_SKIP_NO_MISS', 'DSV4F_CPU_SPIN_US', 'DSV4F_HC_WARP', 'DSV4F_HC_FULL', 'DSV4F_MXFP4_FUSED',
+                                 'DSV4F_GPU_SERVICE', 'DSV4F_GPU_WAIT', 'DSV4F_SKIP_NO_MISS', 'DSV4F_ROUTER_FUSED', 'DSV4F_ROUTER_DEBUG', 'DSV4F_CPU_SPIN_US', 'DSV4F_HC_WARP', 'DSV4F_HC_FULL', 'DSV4F_MXFP4_FUSED',
                                  'DSV4F_CPU_FAST_SYNC', 'DSV4F_CPU_PROFILE',
                                  'DSV4F_CPU_AFFINITY', 'DSV4F_CPU_SCHEDULE', 'DSV4F_CPU_ROW_CHUNK', 'DSV4F_CPU_MXFP4_ROWS',
                                  'DSV4F_CPU_MXFP4_ISA',

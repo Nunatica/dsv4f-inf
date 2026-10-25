@@ -116,6 +116,7 @@ typedef void (*ggml_dsv4f_cpu_fn)(const struct ggml_tensor *, const struct ggml_
 GGML_BACKEND_API ggml_dsv4f_cpu_fn ggml_dsv4f_cpu_experts;
 #define GGML_DSV4F_MOE_TAG 0x44535634
 #define GGML_DSV4F_JOIN_TAG 0x44535635
+#define GGML_DSV4F_ROUTER_TAG 0x44535636
 GGML_BACKEND_API struct ggml_dsv4f_expert_api ggml_dsv4f_experts;
 
 #ifdef __cplusplus

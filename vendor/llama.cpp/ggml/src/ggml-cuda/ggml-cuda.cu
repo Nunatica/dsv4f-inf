@@ -2190,6 +2190,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     switch (dst->op) {
         case GGML_OP_CUSTOM:
+            if (dst->op_params[9] == GGML_DSV4F_ROUTER_TAG) {
+                ggml_cuda_op_dsv4f_router(ctx, dst);
+                break;
+            }
             if (ggml_dsv4f_kv_op(dst)) {
                 if (dst->op_params[9] == GGML_DSV4F_KV_WRITE) ggml_cuda_dsv4f_kv_write(ctx, dst);
                 else ggml_cuda_dsv4f_kv_attn(ctx, dst);
@@ -5484,6 +5488,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         return state && state->device == dev_ctx->device;
     }
     if (op->op == GGML_OP_CUSTOM) {
+        if (op->op_params[9] == GGML_DSV4F_ROUTER_TAG) {
+#if defined(GGML_USE_HIP)
+            return op->type==GGML_TYPE_F32 && op->ne[0]<=32 && op->ne[1]<=4 &&
+                op->src[0]->type==GGML_TYPE_F32 && op->src[0]->nb[0]==4 && op->src[0]->ne[0]<=512 &&
+                op->src[1]->type==GGML_TYPE_F32 && ggml_is_contiguous(op->src[1]);
+#else
+            return false;
+#endif
+        }
         return dev_ctx->device == 0 && (op->op_params[9] == GGML_DSV4F_MOE_TAG || op->op_params[9] == GGML_DSV4F_JOIN_TAG) &&
                ggml_dsv4f_experts.gpu_supported && ggml_dsv4f_experts.gpu_supported(op);
     }

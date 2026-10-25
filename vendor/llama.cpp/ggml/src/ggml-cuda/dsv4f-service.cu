@@ -716,3 +716,50 @@ bool ggml_dsv4f_reserve_vram(int device,size_t bytes,bool allow_reclaim) {
         bytes/1048576.,free/1048576.,configured/1048576.,library_guard/1048576.,allow_reclaim?"allowed":"capture");
     return false;
 }
+
+// One warp per token. Selection keeps bias out of the returned probabilities,
+// and ties choose the smaller expert ID, matching the generic argsort path.
+static __global__ void router_kernel(const char * logits,const float * bias,char * output,
+                                     int ne,int nk,int nt,size_t stride,bool normalize,float scale) {
+    const int lane=threadIdx.x,t=blockIdx.x;
+    float scores[16],rank[16];int selected[16];
+    for(int j=0;j<16;++j) {
+        const int i=lane+j*WARP_SIZE;
+        float score=-INFINITY;
+        if(i<ne) {const float x=*(const float *)(logits+t*stride+i*4);score=sqrtf(x>20.f?x:logf(1.f+expf(x)));}
+        scores[j]=score;rank[j]=i<ne?score+bias[i]:-INFINITY;selected[j]=0;
+        // Keep IDs valid even if an upstream operation produces a NaN.
+        if(__isnanf(rank[j]))rank[j]=-FLT_MAX;
+    }
+    float weight=0.f;
+    for(int k=0;k<nk;++k) {
+        float best=-INFINITY;int id=INT_MAX;
+        for(int j=0;j<16;++j) {
+            const int i=lane+j*WARP_SIZE;
+            if(i<ne && !selected[j] && (id==INT_MAX || rank[j]>best || (rank[j]==best && i<id))) {best=rank[j];id=i;}
+        }
+        for(int offset=WARP_SIZE/2;offset;offset/=2) {
+            const float other=__shfl_xor_sync(0xffffffff,best,offset,WARP_SIZE);
+            const int oi=__shfl_xor_sync(0xffffffff,id,offset,WARP_SIZE);
+            if(other>best || (other==best && oi<id)){best=other;id=oi;}
+        }
+        const float score=__shfl_sync(0xffffffff,scores[id/WARP_SIZE],id%WARP_SIZE,WARP_SIZE);
+        if(lane==id%WARP_SIZE)selected[id/WARP_SIZE]=1;
+        if(lane==k){((int32_t *)output)[t*nk+k]=id;weight=score;}
+    }
+    // Match SUM_ROWS' warp reduction, followed by V4 CLAMP, DIV and SCALE.
+    const float sum=warp_reduce_sum(weight);
+    if(lane<nk)((float *)output)[nk*nt+t*nk+lane]=scale*(normalize?weight/fmaxf(sum,6.103515625e-5f):weight)+0.f;
+}
+void ggml_cuda_op_dsv4f_router(ggml_backend_cuda_context & ctx,ggml_tensor * node) {
+    static std::atomic<bool> reported{false};
+    const char * debug=std::getenv("DSV4F_ROUTER_DEBUG");
+    if(debug && !std::strcmp(debug,"1") && !reported.exchange(true))
+        std::fprintf(stderr,"[dsv4f-router] GPU kernel experts=%lld topk=%lld tokens=%lld\n",
+            (long long)node->src[0]->ne[0],(long long)node->ne[0],(long long)node->ne[1]);
+    float scale;std::memcpy(&scale,&node->op_params[12],4);
+    router_kernel<<<node->ne[1],WARP_SIZE,0,ctx.stream()>>>((const char *)node->src[0]->data,
+        (const float *)node->src[1]->data,(char *)node->data,node->src[0]->ne[0],node->ne[0],
+        node->ne[1],node->src[0]->nb[1],node->op_params[10],scale);
+    CUDA_CHECK(cudaGetLastError());
+}
