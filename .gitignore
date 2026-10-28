@@ -21,4 +21,5 @@ CMakeFiles/
 /state/
 __pycache__/
 *.pyc
+docs
 docs_dev
