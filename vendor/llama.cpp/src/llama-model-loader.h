@@ -259,6 +259,16 @@ struct llama_model_loader {
             llama_progress_callback progress_callback,
             void * progress_callback_user_data);
 
+    // Allocate host weights in bounded batches, reading one batch while the next
+    // is allocated. The caller owns every buffer, including on cancellation.
+    bool load_host_data_pipelined(
+            ggml_context * ctx,
+            ggml_backend_buffer_type_t buft,
+            std::vector<ggml_backend_buffer_ptr> & buffers,
+            size_t batch_size,
+            llama_progress_callback progress_callback,
+            void * progress_callback_user_data);
+
     std::string ftype_name() const;
 
     void print_info() const;

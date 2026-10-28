@@ -11,6 +11,7 @@
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
+#include <chrono>
 #include <future>
 #include <regex>
 
@@ -1793,6 +1794,89 @@ bool llama_model_loader::load_all_data(
     }
 
     return true;
+}
+
+bool llama_model_loader::load_host_data_pipelined(
+        ggml_context * ctx,
+        ggml_backend_buffer_type_t buft,
+        std::vector<ggml_backend_buffer_ptr> & buffers,
+        size_t batch_size,
+        llama_progress_callback progress_callback,
+        void * progress_callback_user_data) {
+    GGML_ASSERT(!use_mmap && !no_alloc && !files.empty() && batch_size > 0 && size_data > 0);
+    GGML_ASSERT(ggml_backend_buft_is_host(buft));
+
+    std::vector<ggml_tensor *> tensors;
+    for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+        GGML_ASSERT(!lazy.has(t) && !t->view_src && !t->data);
+        tensors.push_back(t);
+    }
+    // Sequential reads within each shard also avoid seeking between layers.
+    std::stable_sort(tensors.begin(), tensors.end(), [this](auto * a, auto * b) {
+        const auto * wa = get_weight(a->name);
+        const auto * wb = get_weight(b->name);
+        GGML_ASSERT(wa && wb);
+        return std::make_pair(wa->idx, wa->offs) < std::make_pair(wb->idx, wb->offs);
+    });
+
+    const size_t alignment = ggml_backend_buft_get_alignment(buft);
+    // One reader owns file positions, size_done, validation and callbacks. Its
+    // future is joined before returning/throwing, so no buffers can be freed
+    // while I/O is in flight. Only the following allocation overlaps the read.
+    std::future<bool> reader;
+    for (size_t first = 0; first < tensors.size();) {
+        size_t last = first;
+        size_t bytes = 0;
+        do {
+            const size_t size = GGML_PAD(ggml_backend_buft_get_alloc_size(buft, tensors[last]), alignment);
+            if (last > first && (bytes >= batch_size || size > batch_size - bytes)) {
+                break;
+            }
+            bytes += size;
+            ++last;
+        } while (last < tensors.size());
+
+        // Cancellation may have arrived while the previous read ran.
+        if (reader.valid() && reader.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            if (!reader.get()) {
+                return false;
+            }
+        }
+        ggml_backend_buffer_ptr buffer(ggml_backend_buft_alloc_buffer_n(
+                buft, tensors.data() + first, int(last - first)));
+        if (!buffer) {
+            throw std::runtime_error(format("unable to allocate %s weight batch", ggml_backend_buft_name(buft)));
+        }
+        ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        buffers.emplace_back(std::move(buffer));
+
+        if (reader.valid() && !reader.get()) {
+            return false;
+        }
+        reader = std::async(std::launch::async, [&, first, last] {
+            for (size_t i = first; i < last; ++i) {
+                if (progress_callback && !progress_callback(float(size_done) / size_data, progress_callback_user_data)) {
+                    return false;
+                }
+                auto * t = tensors[i];
+                const auto * w = get_weight(t->name);
+                const auto & file = files.at(w->idx);
+                const size_t size = ggml_nbytes(t);
+                file->seek(w->offs, SEEK_SET);
+                file->read_raw(t->data, size);
+                if (check_tensors && !ggml_validate_row_data(t->type, t->data, size)) {
+                    throw std::runtime_error(format("tensor '%s' has invalid data", t->name));
+                }
+                size_done += size;
+            }
+            return true;
+        });
+        first = last;
+    }
+    if (reader.valid() && !reader.get()) {
+        return false;
+    }
+    return size_done < size_data || !progress_callback || progress_callback(1.0f, progress_callback_user_data);
 }
 
 std::string llama_model_loader::ftype_name() const {

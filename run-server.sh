@@ -22,6 +22,12 @@ export DSV4F_BATCH_TRANSFERS=${DSV4F_BATCH_TRANSFERS:-1}
 export DSV4F_GPU_JOIN=${DSV4F_GPU_JOIN:-1}
 export DSV4F_PINNED_COMPUTE=${DSV4F_PINNED_COMPUTE:-1}
 export DSV4F_PINNED_WEIGHTS=${DSV4F_PINNED_WEIGHTS:-$DSV4F_PINNED_COMPUTE}
+export DSV4F_LOAD_MODE=${DSV4F_LOAD_MODE:-dio}
+case "$DSV4F_LOAD_MODE" in none|dio) ;; *) echo 'DSV4F_LOAD_MODE must be none or dio.' >&2; exit 1;; esac
+export DSV4F_LOAD_PIPELINE_MIB=${DSV4F_LOAD_PIPELINE_MIB:-1024}
+if [[ ! $DSV4F_LOAD_PIPELINE_MIB =~ ^[0-9]{1,5}$ ]] || ((10#$DSV4F_LOAD_PIPELINE_MIB > 65536)); then
+    echo 'DSV4F_LOAD_PIPELINE_MIB must be an integer in 0..65536 (0 disables pipelining).' >&2; exit 1
+fi
 export DSV4F_EXPERT_GRAPHS=${DSV4F_EXPERT_GRAPHS:-1}
 export DSV4F_FUSED_HC_MIX=${DSV4F_FUSED_HC_MIX:-1}
 export DSV4F_GPU_SERVICE=${DSV4F_GPU_SERVICE:-1}
@@ -90,7 +96,7 @@ if [[ $DSV4F_MTP == 1 ]]; then
 fi
 BUILD_DIR=${BUILD_DIR:-$ROOT/build}
 args=(--model "$MODEL" --ctx-size "$CTX_SIZE" --cache-type-k q8_0 --cache-type-v q8_0
-      --load-mode none --lazy-mode off --no-repack --cpu-moe --n-gpu-layers 999 --fit off
+      --load-mode "$DSV4F_LOAD_MODE" --lazy-mode off --no-repack --cpu-moe --n-gpu-layers 999 --fit off
       --threads "$DSV4F_CPU_THREADS" --threads-batch "$DSV4F_CPU_THREADS"
       --batch-size "${BATCH_SIZE:-5120}" --ubatch-size "${UBATCH_SIZE:-5120}"
       --flash-attn on --parallel 1 --host "$HOST" --port "$PORT" --api-key "$API_KEY"
