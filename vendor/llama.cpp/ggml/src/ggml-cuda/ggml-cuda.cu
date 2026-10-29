@@ -944,7 +944,7 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
         : ggml_nbytes(tensor);
     const ggml_dsv4f_mmq_workspace mmq_workspace(tensor);
     if (mmq_workspace.enabled) size = mmq_workspace.size;
-    if (ggml_dsv4f_kv_op(tensor) && tensor->op_params[9] == GGML_DSV4F_KV_ATTN) {
+    if (ggml_dsv4f_kv_op(tensor) && tensor->op_params[9] != GGML_DSV4F_KV_WRITE) {
         size = dsv4f_kv_scratch(tensor).size;
     }
     int64_t ne0 = tensor->ne[0];
@@ -5484,6 +5484,12 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
 static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
     if (ggml_dsv4f_kv_op(op)) {
+        if(op->op_params[9]==GGML_DSV4F_CSA_ATTN) {
+            const auto * src=op->src[4];
+            while(src->view_src)src=src->view_src;
+            return !src->buffer || (ggml_backend_buffer_is_cuda(src->buffer) &&
+                ((ggml_backend_cuda_buffer_context *)src->buffer->context)->device==dev_ctx->device);
+        }
         const auto * state = (const dsv4f_kv_state *) ggml_dsv4f_kv_state(op);
         return state && state->device == dev_ctx->device;
     }

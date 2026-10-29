@@ -619,7 +619,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
     const int k_VKQ_0 = kb0 * nbatch_fa;
 #if defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
-    if constexpr (DKQ == 512 && DV == 512 && ncols1 == 4 && ncols2 == 8 && !use_sparse && nstages == 0) {
+    if constexpr (DKQ == 512 && DV == 512 && ((ncols1 == 4 && ncols2 == 8) || (ncols1 == 1 && ncols2 == 32)) && !use_sparse && nstages == 0) {
         // The D512 HIP prefill dispatcher requires a mask and no ALiBi.
         // Avoid loading/multiplying KV chunks invisible to every query here.
         bool live = false;
@@ -1897,7 +1897,7 @@ static __global__ void flash_attn_ext_f16(
     // Only the explicitly dispatched 32-column RDNA3 D512 prefill layout is
     // enabled. In particular, the old 64-column layout exceeds gfx1100 LDS.
 #if defined(RDNA3)
-    constexpr bool hip_d512 = DKQ == 512 && DV == 512 && ncols1 == 4 && ncols2 == 8;
+    constexpr bool hip_d512 = DKQ == 512 && DV == 512 && ((ncols1 == 4 && ncols2 == 8) || (ncols1 == 1 && ncols2 == 32));
 #else
     constexpr bool hip_d512 = false;
 #endif

@@ -15,6 +15,8 @@ export GGML_HIP_PREFILL_FA=${GGML_HIP_PREFILL_FA:-2}
 case "$GGML_HIP_PREFILL_FA" in 0|1|2) ;; *) echo 'GGML_HIP_PREFILL_FA must be 0, 1 or 2.' >&2; exit 1;; esac
 export GGML_HIP_INDEXER_WMMA=${GGML_HIP_INDEXER_WMMA:-1}
 case "$GGML_HIP_INDEXER_WMMA" in 0|1) ;; *) echo 'GGML_HIP_INDEXER_WMMA must be 0 or 1.' >&2; exit 1;; esac
+export GGML_HIP_CSA_TOPK=${GGML_HIP_CSA_TOPK:-1}
+case "$GGML_HIP_CSA_TOPK" in 0|1) ;; *) echo 'GGML_HIP_CSA_TOPK must be 0 or 1.' >&2; exit 1;; esac
 export GGML_CUDA_MOE_CACHE=0
 export DSV4F_CPU_THREADS=${DSV4F_CPU_THREADS:-12}
 export DSV4F_VRAM_HEADROOM_MIB=${DSV4F_VRAM_HEADROOM_MIB:-256}

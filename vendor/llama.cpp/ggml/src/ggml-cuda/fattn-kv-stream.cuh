@@ -107,7 +107,10 @@ static __global__ void kv_stream_prefill_keys(const char * raw, int64_t raw_stri
         } else keys[int64_t(row)*512 + col] = ((const half *) source)[col];
     }
 }
+#include "csa-topk.cuh"
+
 void ggml_cuda_dsv4f_kv_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if(dst->src[5]) { ggml_cuda_csa_topk(ctx,dst); return; }
     auto & s = *(dsv4f_kv_state *) ggml_dsv4f_kv_state(dst);
     GGML_ASSERT(ctx.device == s.device);
     const auto * q = dst->src[0];

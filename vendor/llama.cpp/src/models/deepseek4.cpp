@@ -765,12 +765,26 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     cb(raw_k, "csa_raw_k", il);
 
     const auto * csa_ctx = inp_dsv4->mctx->get_csa();
+    ggml_backend_t indexed_backend=nullptr;
+    const char * mode=std::getenv("GGML_HIP_CSA_TOPK");
+    if((!mode || std::string(mode)=="1") && cparams.flash_attn && !cparams.cb_eval && top_k->ne[0]<=512 && sched) {
+        for(int b=0;b<ggml_backend_sched_get_n_backends(sched);++b) {
+            auto * backend=ggml_backend_sched_get_backend(sched,b);
+            auto * dev=ggml_backend_get_device(backend);
+            if(dev==model.dev_layer(il) && std::string(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)))=="ROCm")indexed_backend=backend;
+        }
+    }
+    const bool indexed=indexed_backend!=nullptr &&
+        (raw_k->type==GGML_TYPE_F16 || raw_k->type==GGML_TYPE_Q8_0);
     if (auto * state = csa_ctx->get_stream_state(il)) {
         if (!cparams.flash_attn) {
             throw std::runtime_error("KV streaming requires flash attention; use --flash-attn on or DSV4F_KV_RESIDENT=0");
         }
-        ggml_tensor * csa_mask = build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il);
-        ggml_tensor * mask = ggml_concat(ctx0, inp_attn->get_kq_mask(), csa_mask, 0);
+        ggml_tensor * mask = inp_attn->get_kq_mask();
+        if (!indexed) {
+            ggml_tensor * csa_mask = build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il);
+            mask = ggml_concat(ctx0, mask, csa_mask, 0);
+        }
         const auto streams = raw_k->ne[3];
         ggml_tensor * qs = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/streams, streams,
                                       q->nb[1], q->nb[2], q->nb[2]*(q->ne[2]/streams), 0);
@@ -778,7 +792,10 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
         ggml_tensor * raw = ggml_permute(ctx0, raw_k, 0, 2, 1, 3);
         const int bound = raw_k->ne[2] + top_k->ne[0];
         auto * out = ggml_dsv4f_kv_attn(ctx0, state, csa_ctx->get_stream_offset(),
-                                     qs, raw, mask, sinks, bound, kq_scale, csa_ctx->get_stream_commit(il));
+                                     qs, raw, mask, sinks, bound, kq_scale, csa_ctx->get_stream_commit(il),
+                                     indexed ? top_k : nullptr, indexed ? inp_csa.kq_mask : nullptr,
+                                     indexed ? hparams.n_swa : 0);
+        if(indexed)ggml_backend_sched_set_tensor_backend(sched,out,indexed_backend);
         out = ggml_reshape_2d(ctx0, out, out->ne[0]*out->ne[1], out->ne[2]*out->ne[3]);
         if (k_rot) out = llama_mul_mat_hadamard(ctx0, out, k_rot);
         cb(out, "attn_csa_streamed", il);
@@ -794,6 +811,21 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
             csa_k->ne[0], csa_k->ne[1], n_csa, csa_k->ne[3],
             csa_k->nb[1], csa_k->nb[2], csa_k->nb[3], 0);
     cb(csa_k, "csa_comp_k", il);
+
+    if(indexed && (csa_k->type==GGML_TYPE_F16 || csa_k->type==GGML_TYPE_Q8_0)) {
+        const auto streams=raw_k->ne[3];
+        auto * qs=ggml_view_4d(ctx0,q,q->ne[0],q->ne[1],q->ne[2]/streams,streams,
+            q->nb[1],q->nb[2],q->nb[2]*(q->ne[2]/streams),0);
+        qs=ggml_permute(ctx0,qs,0,2,1,3);
+        auto * out=ggml_dsv4f_csa_attn(ctx0,qs,ggml_permute(ctx0,raw_k,0,2,1,3),
+            ggml_permute(ctx0,csa_k,0,2,1,3),inp_attn->get_kq_mask(),inp_csa.kq_mask,
+            top_k,sinks,hparams.n_swa,kq_scale);
+        ggml_backend_sched_set_tensor_backend(sched,out,indexed_backend);
+        out=ggml_reshape_2d(ctx0,out,out->ne[0]*out->ne[1],out->ne[2]*out->ne[3]);
+        if(k_rot)out=llama_mul_mat_hadamard(ctx0,out,k_rot);
+        cb(out,"attn_csa_topk",il);
+        return out;
+    }
 
     ggml_tensor * k_all = ggml_concat(ctx0, raw_k, csa_k, 2);
     cb(k_all, "csa_k_all", il);
