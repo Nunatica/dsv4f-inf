@@ -31,8 +31,6 @@ python3 --version
 
 The llama.cpp source is included under `vendor/llama.cpp`. The provided build disables OpenSSL and uses the included `web/` assets, so no OpenSSL development package, Node.js, or npm install is needed for serving.
 
-CPU optimizations are enabled by default: `DSV4F_NATIVE=ON` adds `-march=native` to the project's C++ targets and `llama` (including `src/moe.cpp` and `src/mxfp4.cpp`), alongside the existing `GGML_NATIVE=ON` CPU backend setting. These binaries target the build machine's CPU. `DSV4F_CPU_LTO=ON` enables CMake IPO/LTO on the host C/C++ libraries, server, and tests; HIP/CUDA targets are excluded so GCC LTO objects stay within the host toolchain. The global `GGML_LTO` option is kept off. For a manual CMake build, either project option can be disabled with `-DDSV4F_NATIVE=OFF` or `-DDSV4F_CPU_LTO=OFF`.
-
 ### AMD GPU (ROCm / HIP)
 
 Install an AMD GPU driver compatible with your GPU and ROCm release, plus **ROCm/HIP 6.1 or newer**. The build requires the HIP compiler/device libraries and the **hipBLAS and rocBLAS development libraries**, including their CMake package files.

@@ -3,6 +3,7 @@
 
 #include "llama-kv-cache-dsv4.h"
 #include "ggml-backend-moe-cache.h"
+#include "ggml-dsv4f-topk.h"
 #include "moe.h"
 
 #include <algorithm>
@@ -696,7 +697,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
     }
 
     const uint32_t n_top_k = indexer_score->ne[0] < hparams.indexer_top_k ? indexer_score->ne[0] : hparams.indexer_top_k;
-    ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, indexer_score, n_top_k));
+    ggml_tensor * top_k = ggml_cont(ctx0, ggml_dsv4f_indexer_top_k(ctx0, indexer_score, n_top_k));
     cb(top_k, "lid_top_k", il);
 
     return top_k;

@@ -1,5 +1,6 @@
 #include "argsort.cuh"
 #include "top-k.cuh"
+#include "indexer-top512.cuh"
 
 // Adjusted implementation thresholds from #28547, can be overridden at build time
 #ifndef GGML_CUDA_TOP_K_NCOLS_THRESHOLD_BITONIC
@@ -293,6 +294,10 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t    nrows = ggml_nrows(src0);
     const int64_t    k     = dst->ne[0];
     ggml_cuda_pool & pool  = ctx.pool();
+
+#if defined(GGML_USE_HIP)
+    if (ggml_cuda_indexer_top512(ctx, dst)) return;
+#endif
 
     const int device = ggml_cuda_get_device();
 

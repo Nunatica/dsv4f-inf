@@ -15,6 +15,9 @@ export GGML_HIP_PREFILL_FA=${GGML_HIP_PREFILL_FA:-2}
 case "$GGML_HIP_PREFILL_FA" in 0|1|2) ;; *) echo 'GGML_HIP_PREFILL_FA must be 0, 1 or 2.' >&2; exit 1;; esac
 export GGML_HIP_INDEXER_WMMA=${GGML_HIP_INDEXER_WMMA:-1}
 case "$GGML_HIP_INDEXER_WMMA" in 0|1) ;; *) echo 'GGML_HIP_INDEXER_WMMA must be 0 or 1.' >&2; exit 1;; esac
+# Indexer-only top-512: 0 original, 1 CTA radix (default), 2 experimental chunk sort/merge.
+export GGML_HIP_INDEXER_TOP512=${GGML_HIP_INDEXER_TOP512:-1}
+case "$GGML_HIP_INDEXER_TOP512" in 0|1|2) ;; *) echo 'GGML_HIP_INDEXER_TOP512 must be 0, 1 or 2.' >&2; exit 1;; esac
 export GGML_HIP_CSA_TOPK=${GGML_HIP_CSA_TOPK:-1}
 case "$GGML_HIP_CSA_TOPK" in 0|1) ;; *) echo 'GGML_HIP_CSA_TOPK must be 0 or 1.' >&2; exit 1;; esac
 export GGML_CUDA_MOE_CACHE=0
