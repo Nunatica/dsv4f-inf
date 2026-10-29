@@ -2,8 +2,12 @@
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
+#if defined(GGML_USE_HIP)
+#include "q8-projection.cuh"
+#endif
 
 #include <cstdint>
+#include <cstring>
 #include <type_traits>
 
 // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
@@ -1118,6 +1122,30 @@ static void mul_mat_vec_q_switch_ncols_dst(
     const mmvq_parameter_table_id table_id  = get_device_table_id(cc);
 
     const bool has_ids = ids != nullptr;
+
+#if defined(GGML_USE_HIP)
+    // V4 Q-B: the eight-warp reference has only four active warps at K=1024.
+    // Preserve its eight virtual partial sums while packing four output rows.
+    // Keep other shapes, epilogues, batches and GPU architectures unchanged.
+    if constexpr (type == GGML_TYPE_Q8_0) {
+        const char * enabled = std::getenv("GGML_HIP_Q8_PROJECTION");
+        if ((!enabled || !std::strcmp(enabled, "1")) && table_id == MMVQ_PARAMETERS_RDNA3_0 &&
+            ncols_dst == 1 && !has_ids && ncols_x == 1024 && nrows_x == 32768 &&
+            !fusion.gate && !fusion.x_bias && !fusion.gate_bias && !fusion.shared_up &&
+            !fusion.x_scale && !fusion.gate_scale) {
+            static const bool debug = std::getenv("GGML_HIP_Q8_PROJECTION_DEBUG") != nullptr;
+            static std::once_flag logged;
+            if (debug) std::call_once(logged, [] {
+                std::fprintf(stderr, "[hip-q8-projection] K=1024 M=32768 warps=2 rows=4 ordered_partials=8\n");
+            });
+            dsv4f_q8_projection_launch<2, 4>(vx, vy, dst, ncols_x, nrows_x,
+                stride_row_x, nchannels_dst, nsamples_dst, stride_channel_x,
+                stride_channel_y, stride_channel_dst, stride_sample_x,
+                stride_sample_y, stride_sample_dst, channel_ratio_fd, sample_ratio_fd, stream);
+            return;
+        }
+    }
+#endif
 
     // How the K loop divides up at the baseline block width, both decisions below use these.
     constexpr int qk                    = ggml_cuda_type_traits<type>::qk;
