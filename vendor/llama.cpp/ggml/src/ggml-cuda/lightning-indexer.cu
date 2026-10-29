@@ -2,6 +2,10 @@
 #include "lightning-indexer.cuh"
 #include "fattn-common.cuh"
 #include "convert.cuh"
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
+#include "lightning-indexer-hip.cuh"
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #if defined(TURING_MMA_AVAILABLE)
@@ -614,6 +618,30 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int device = ggml_cuda_get_device();
     const int cc     = ggml_cuda_info().devices[device].cc;
+
+#if defined(GGML_USE_HIP)
+    // Leave decode and unsupported shapes on the FP32 path; 0 disables WMMA.
+    const char * wmma_mode = std::getenv("GGML_HIP_INDEXER_WMMA");
+    if ((!wmma_mode || std::strcmp(wmma_mode, "1") == 0) &&
+        GGML_CUDA_CC_IS_RDNA3_0(cc) && n_embd == 128 && n_head == 64 && n_batch >= 32 &&
+        (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0)) {
+        static std::atomic<bool> announced{false};
+        if (!announced.exchange(true)) {
+            std::fprintf(stderr, "[hip-indexer-wmma] 16-query/128-key tile, FP16 QK, FP32 scores; queries=%d keys=%d type=%s\n",
+                n_batch, n_kv, ggml_type_name(k->type));
+        }
+        const dim3 grid((n_kv + 127)/128, (n_batch + 15)/16, n_stream);
+        const dim3 block(32, 8);
+#define HIP_INDEXER_WMMA(TYPE) lightning_indexer_hip_wmma<TYPE><<<grid, block, 0, ctx.stream()>>>( \
+            q_d, k_d, w_d, m_d, dst_d, n_batch, n_kv, nb1, nb3, \
+            nbq1, nbq2, nbq3, nbk2, nbk3, nbw1, nbw3, nbm1, nbm3, nem3)
+        if (k->type == GGML_TYPE_F16) { HIP_INDEXER_WMMA(GGML_TYPE_F16); }
+        else { HIP_INDEXER_WMMA(GGML_TYPE_Q8_0); }
+#undef HIP_INDEXER_WMMA
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+#endif
 
     if (n_embd == 128 && n_head == 64) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)

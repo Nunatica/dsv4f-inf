@@ -89,7 +89,7 @@ For access from another device on your LAN, open `http://<server-local-ip>:8080`
 
 | Implementation | Prefill (tok/s) | Decode (tok/s) |
 | --- | ---: | ---: |
-| dsv4f-inf | 355 | 19.30 |
+| dsv4f-inf | 426 | 19.17 |
 | llama cpp - moe expert cache + mtp | 197 | 12.43 |
 | llama cpp - full expert offloading + mtp | 195 | 11.33 |
 
@@ -99,6 +99,7 @@ Data was measured at target system. test was done with same prompt with PROMPT_T
 - [llama.cpp](https://github.com/ggml-org/llama.cpp)
 - [Strata](https://github.com/Niko1221/Strata)
 - [project-maya](https://github.com/mw00/project-maya)
+- [ds4](https://github.com/antirez/ds4)
 
 ## License
 Project itself is under MIT License. included llama.cpp source follows its own license.
