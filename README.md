@@ -87,7 +87,7 @@ For access from another device on your LAN, open `http://<server-local-ip>:8080`
 
 | Implementation | Prefill (tok/s) | Decode (tok/s) |
 | --- | ---: | ---: |
-| dsv4f-inf | 426 | 19.17 |
+| dsv4f-inf | 445 | 19.69 |
 | llama cpp - moe expert cache + mtp | 197 | 12.43 |
 | llama cpp - full expert offloading + mtp | 195 | 11.33 |
 
