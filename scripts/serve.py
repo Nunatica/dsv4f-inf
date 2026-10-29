@@ -102,7 +102,7 @@ def main():
                                  'GGML_CUDA_GRAPH_OPT', 'GGML_CUDA_NO_PINNED',
                                  'GGML_HIP_SPARSE_FA', 'GGML_HIP_SPARSE_FA_DEBUG',
                                  'GGML_HIP_PREFILL_FA', 'GGML_HIP_PREFILL_FA_DEBUG',
-                                 'GGML_HIP_INDEXER_WMMA', 'GGML_HIP_CSA_TOPK', 'GGML_HIP_INDEXER_TOP512') if k in os.environ},
+                                 'GGML_HIP_QNORM_ROPE', 'GGML_HIP_INDEXER_WMMA', 'GGML_HIP_CSA_TOPK', 'GGML_HIP_INDEXER_TOP512') if k in os.environ},
                              'swap_protected': True, 'load_seconds': time.monotonic()-started}
                     temporary = manifest.with_suffix('.tmp')
                     temporary.write_text(json.dumps(state, indent=2))

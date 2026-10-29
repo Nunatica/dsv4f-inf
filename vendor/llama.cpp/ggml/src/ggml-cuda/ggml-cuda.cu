@@ -4430,6 +4430,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+#if defined(GGML_USE_HIP)
+    if (i+1 < cgraph->n_nodes && node->op == GGML_OP_RMS_NORM &&
+        ggml_cuda_should_fuse_qnorm_rope(node,cgraph->nodes[i+1]) &&
+        ggml_can_fuse_subgraph(cgraph,i,{GGML_OP_RMS_NORM,GGML_OP_ROPE},{i+1})) {
+        ggml_cuda_op_qnorm_rope_fused(*cuda_ctx,node,cgraph->nodes[i+1]);
+        return 1;
+    }
+#endif
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
         return 4;

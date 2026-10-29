@@ -13,6 +13,9 @@ export GGML_HIP_SPARSE_FA=${GGML_HIP_SPARSE_FA:-1}
 case "$GGML_HIP_SPARSE_FA" in 0|1) ;; *) echo 'GGML_HIP_SPARSE_FA must be 0 or 1.' >&2; exit 1;; esac
 export GGML_HIP_PREFILL_FA=${GGML_HIP_PREFILL_FA:-2}
 case "$GGML_HIP_PREFILL_FA" in 0|1|2) ;; *) echo 'GGML_HIP_PREFILL_FA must be 0, 1 or 2.' >&2; exit 1;; esac
+# Unweighted Q-head RMSNorm + tail RoPE fusion (enabled by default).
+export GGML_HIP_QNORM_ROPE=${GGML_HIP_QNORM_ROPE:-1}
+case "$GGML_HIP_QNORM_ROPE" in 0|1) ;; *) echo 'GGML_HIP_QNORM_ROPE must be 0 or 1.' >&2; exit 1;; esac
 export GGML_HIP_INDEXER_WMMA=${GGML_HIP_INDEXER_WMMA:-1}
 case "$GGML_HIP_INDEXER_WMMA" in 0|1) ;; *) echo 'GGML_HIP_INDEXER_WMMA must be 0 or 1.' >&2; exit 1;; esac
 # Indexer-only top-512: 0 original, 1 CTA radix (default), 2 experimental chunk sort/merge.

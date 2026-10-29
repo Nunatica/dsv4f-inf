@@ -2,6 +2,9 @@
 #include "ggml-cuda/common.cuh"
 #include "ggml.h"
 #include "rope.cuh"
+#include <atomic>
+#include <cstdio>
+#include <cstring>
 
 struct rope_corr_dims {
     float v[2];
@@ -949,3 +952,96 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
         GGML_ABORT("fatal error");
     }
 }
+
+#if defined(GGML_USE_HIP)
+// Unweighted Q-head RMSNorm + tail RoPE. Use the original norm's 256-thread
+// reduction and the original RoPE phase/YaRN helpers. Normalized values are
+// rounded to F32 before rotation, as in the separate kernels.
+static __global__ void qnorm_rope_tail_f32(
+        const float * x, float * dst, int nh, int nq, int ns,
+        int64_t xs1, int64_t xs2, int64_t xs3,
+        int64_t ds1, int64_t ds2, int64_t ds3,
+        float eps, int nd, int off, bool neox, const int32_t * pos,
+        float freq_scale, float ext_factor, float attn_factor,
+        rope_corr_dims corr, float theta_scale, const float * factors) {
+    const int h = blockIdx.x, tid = threadIdx.x;
+    __shared__ float sums[32];
+    for (int sample = blockIdx.z; sample < ns; sample += gridDim.z) {
+        for (int query = blockIdx.y; query < nq; query += gridDim.y) {
+            const float * row = x + sample*xs3 + query*xs2 + h*xs1;
+            float * out = dst + sample*ds3 + query*ds2 + h*ds1;
+            float sum = 0;
+            for (int col = tid; col < 512; col += 256) {
+                const float v = row[col];sum += v*v;
+            }
+            sum = block_reduce<block_reduce_method::SUM,256>(sum,sums);
+            const float scale = rsqrtf(sum/512 + eps);
+            const int i = 2*tid;
+            const bool rotate = i >= off && i < off+nd;
+            const int relative = i-off;
+            const int i0 = rotate && neox ? off+relative/2 : i;
+            const int i1 = rotate && neox ? i0+nd/2 : i+1;
+            const float a = __fmul_rn(scale,row[i0]);
+            const float b = __fmul_rn(scale,row[i1]);
+            if (rotate) {
+                const float phase = pos[query]*powf(theta_scale,relative/2.0f);
+                const float factor = factors ? factors[relative/2] : 1.0f;
+                float c,ss;
+                rope_yarn<true>(phase/factor,freq_scale,corr,relative,ext_factor,attn_factor,c,ss);
+                out[i0] = a*c-b*ss;
+                out[i1] = a*ss+b*c;
+            } else {
+                out[i0] = a;out[i1] = b;
+            }
+            // Preserve shared reduction storage when grid limits require reuse.
+            __syncthreads();
+        }
+    }
+}
+
+bool ggml_cuda_should_fuse_qnorm_rope(const ggml_tensor * norm,const ggml_tensor * rope) {
+    const char * mode = std::getenv("GGML_HIP_QNORM_ROPE");
+    if (mode && std::strcmp(mode,"1")) return false;
+    if (norm->op != GGML_OP_RMS_NORM || rope->op != GGML_OP_ROPE || rope->src[0] != norm) return false;
+    const ggml_tensor * x = norm->src[0];
+    if (x->type != GGML_TYPE_F32 || norm->type != GGML_TYPE_F32 || rope->type != GGML_TYPE_F32 ||
+        x->ne[0] != 512 || x->nb[0] != sizeof(float) || !ggml_are_same_shape(x,rope) ||
+        rope->nb[0] != sizeof(float) || !rope->src[1] || rope->src[1]->type != GGML_TYPE_I32 ||
+        !ggml_is_contiguous(rope->src[1])) return false;
+    const int nd = rope->op_params[1], off = rope->op_params[15], type = rope->op_params[2];
+    if (nd <= 0 || nd%2 || off <= 0 || off%2 || off+nd != 512 ||
+        (type != GGML_ROPE_TYPE_NORMAL && type != GGML_ROPE_TYPE_NEOX)) return false;
+    if (rope->src[2] && (rope->src[2]->type != GGML_TYPE_F32 || !ggml_is_contiguous(rope->src[2]))) return false;
+    // Reads/writes may alias only with identical row layout. Every CTA finishes
+    // its norm reduction before replacing its own pairs, making this safe.
+    const auto overlaps = [](const ggml_tensor * a,const ggml_tensor * b) {
+        if (!a->data || !b->data) return false;
+        const uintptr_t ap=(uintptr_t)a->data,bp=(uintptr_t)b->data;
+        return ap < bp+ggml_nbytes(b) && bp < ap+ggml_nbytes(a);
+    };
+    if (overlaps(x,rope) && (x->data != rope->data || std::memcmp(x->nb,rope->nb,sizeof(x->nb)))) return false;
+    if (overlaps(rope,rope->src[1]) || (rope->src[2] && overlaps(rope,rope->src[2]))) return false;
+    return true;
+}
+
+void ggml_cuda_op_qnorm_rope_fused(ggml_backend_cuda_context & ctx,ggml_tensor * norm,ggml_tensor * rope) {
+    const ggml_tensor * x = norm->src[0];
+    float eps;memcpy(&eps,norm->op_params,sizeof(eps));
+    GGML_ASSERT(eps >= 0 && x->ne[0] == 512);
+    float params[6];memcpy(params,rope->op_params+5,sizeof(params));
+    const int nd=rope->op_params[1], off=rope->op_params[15];
+    rope_corr_dims corr;
+    ggml_rope_yarn_corr_dims(nd,rope->op_params[4],params[0],params[4],params[5],corr.v);
+    const float theta_scale=powf(params[0],-2.0f/nd);
+    static std::atomic<bool> announced{false};
+    if (!announced.exchange(true)) std::fprintf(stderr,
+        "[hip-qnorm-rope] fused D512 RMSNorm + tail RoPE; heads=%ld queries=%ld offset=%d dims=%d\n",
+        (long)x->ne[1],(long)x->ne[2],off,nd);
+    const dim3 grid(x->ne[1],MIN(x->ne[2],UINT16_MAX),MIN(x->ne[3],UINT16_MAX));
+    qnorm_rope_tail_f32<<<grid,256,0,ctx.stream()>>>((const float *)x->data,(float *)rope->data,
+        x->ne[1],x->ne[2],x->ne[3],x->nb[1]/4,x->nb[2]/4,x->nb[3]/4,
+        rope->nb[1]/4,rope->nb[2]/4,rope->nb[3]/4,eps,nd,off,rope->op_params[2]==GGML_ROPE_TYPE_NEOX,
+        (const int32_t *)rope->src[1]->data,params[1],params[2],params[3],corr,theta_scale,
+        rope->src[2] ? (const float *)rope->src[2]->data : nullptr);
+}
+#endif
