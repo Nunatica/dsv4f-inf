@@ -5,6 +5,9 @@
 #include "ggml-backend-moe-cache.h"
 #include "ggml-dsv4f-topk.h"
 #include "moe.h"
+#include "direct-weights.h"
+#include "routing-table.h"
+#include <numeric>
 
 #include <algorithm>
 #include <cmath>
@@ -184,6 +187,65 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
             layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", i), {n_embd},             TENSOR_NOT_REQUIRED | flags);
         }
     }
+
+    // Plan all main layers together, before allocating or reading expert weights.
+    // The separate MTP model retains its original expert weights and routing.
+    if (!(trunk_flags & (TENSOR_SKIP | TENSOR_NOT_REQUIRED))) {
+        std::vector<dsv4f_pruning_layer> plans;
+        for(int i=0;i<n_layer;++i) {
+            auto & l=layers[i];std::vector<int32_t> local(n_expert);std::iota(local.begin(),local.end(),0);
+            plans.push_back({i,int(n_expert),int(hparams.n_expert_used(i)),
+                {{l.ffn_gate_exps->name,std::move(local),l.ffn_gate_exps->nb[2]+l.ffn_up_exps->nb[2]+l.ffn_down_exps->nb[2]}}});
+        }
+        const auto masks=dsv4f_pruning_masks(plans);
+        const bool compact=!ml.use_mmap && !dsv4f_direct_weights_enabled();
+        size_t original=0,retained=0;
+        for(size_t i=0;i<masks.size();++i) {
+            auto & l=layers[i];const auto & mask=masks[i];
+            auto constant=[&](ggml_type type,int64_t ne0,int64_t ne1,const void * data,const char * role) {
+                ggml_context_ptr ctx{ggml_init({ggml_tensor_overhead(),nullptr,true})};
+                if(!ctx)throw std::runtime_error("cannot create pruning constants");
+                auto * tensor=ggml_new_tensor_2d(ctx.get(),type,ne0,ne1);
+                ggml_format_name(tensor,"v4_pruning_%s_%zu",role,i);
+                const auto buft=ggml_backend_dev_buffer_type(dev_layer(i));
+                ggml_backend_buffer_ptr buffer{hparams.no_alloc?ggml_backend_buft_alloc_buffer(buft,0):ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(),buft)};
+                if(!buffer)throw std::runtime_error("cannot allocate pruning constants");
+                if(hparams.no_alloc)tensor->buffer=buffer.get();
+                else ggml_backend_tensor_set(tensor,data,0,ggml_nbytes(tensor));
+                add_constant_buffer(std::move(ctx),std::move(buffer));return tensor;
+            };
+            auto bias=[&](ggml_tensor * tensor,const char * role) {
+                std::vector<float> values(n_expert,0.f);
+                if(tensor) {
+                    const auto & w=ml.require_weight(tensor->name);
+                    if(w.tensor->type!=GGML_TYPE_F32)throw std::runtime_error("pruning requires F32 routing bias");
+                    ml.files.at(w.idx)->seek(w.offs,SEEK_SET);ml.files.at(w.idx)->read_raw(values.data(),values.size()*sizeof(float));
+                }
+                for(size_t id=0;id<mask.size();++id)if(mask[id]<0)values[id]=mask[id];
+                return constant(GGML_TYPE_F32,n_expert,1,values.data(),role);
+            };
+            l.ffn_exp_probs_b=bias(l.ffn_exp_probs_b,"bias");
+            if(l.ffn_exp_probs_b_vl)l.ffn_exp_probs_b_vl=bias(l.ffn_exp_probs_b_vl,"vision_bias");
+            if(l.ffn_gate_tid2eid) {
+                const auto & w=ml.require_weight(l.ffn_gate_tid2eid->name);
+                if(w.tensor->type!=GGML_TYPE_I32)throw std::runtime_error("pruning requires I32 hash routes");
+                std::vector<int32_t> ids(ggml_nelements(w.tensor));
+                ml.files.at(w.idx)->seek(w.offs,SEEK_SET);ml.files.at(w.idx)->read_raw(ids.data(),ids.size()*sizeof(int32_t));
+                dsv4f_pruning_repair_hash(ids,int(w.tensor->ne[0]),l.ffn_gate_exps->name,mask);
+                l.ffn_gate_tid2eid=constant(GGML_TYPE_I32,w.tensor->ne[0],w.tensor->ne[1],ids.data(),"hash");
+            }
+            if(compact) {
+                std::vector<int32_t> keep,local(n_expert,-1);
+                for(int id=0;id<n_expert;++id)if(mask[id]==0){local[id]=keep.size();keep.push_back(id);}
+                for(auto * tensor:{l.ffn_gate_exps,l.ffn_up_exps,l.ffn_down_exps}) {
+                    original+=ggml_nbytes(tensor);ml.compact_experts(tensor,keep);retained+=ggml_nbytes(tensor);
+                }
+                l.ffn_expert_ids=constant(GGML_TYPE_I32,1,n_expert,local.data(),"ids");
+            }
+        }
+        if(original)std::fprintf(stderr,"[dsv4f-pruning] resident weights: original_bytes=%zu active_bytes=%zu skipped_bytes=%zu (excluded planes not allocated or read)\n",original,retained,original-retained);
+    }
+
 }
 
 std::unique_ptr<llm_graph_context> llama_model_deepseek4::build_arch_graph(const llm_graph_params & params) const {
@@ -1302,6 +1364,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
 
 llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_graph_context(params) {
+    for(const auto & layer:model.layers)if(layer.ffn_expert_ids)dsv4f_expert_maps[layer.ffn_gate_exps]=layer.ffn_expert_ids;
+
     ggml_tensor * cur;
 
     ggml_tensor * inp = build_inp_embd(model.tok_embd);

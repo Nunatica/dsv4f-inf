@@ -7,6 +7,7 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#include "direct-weights.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1874,17 +1875,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // create the backend buffers
     std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_buf_maps;
     ctx_buf_maps.reserve(ml.ctx_map.size());
-
-    size_t load_batch_size = 0;
-    if (const char * value = std::getenv("DSV4F_LOAD_PIPELINE_MIB")) {
-        char * end = nullptr;
-        const long mib = std::strtol(value, &end, 10);
-        if (end == value || *end || mib < 0 || mib > 65536) {
-            throw std::runtime_error("DSV4F_LOAD_PIPELINE_MIB must be an integer in 0..65536");
-        }
-        load_batch_size = size_t(mib) * 1024 * 1024;
-    }
-    std::vector<std::pair<size_t, ggml_backend_buffer_type_t>> pipelined_contexts;
+    const size_t load_batch_size=dsv4f_load_pipeline_bytes();
+    std::vector<std::pair<size_t,ggml_backend_buffer_type_t>> pipelined_contexts;
 
     // Ensure we have enough capacity for the maximum backend buffer we will potentially create
     const size_t n_max_backend_buffer = ml.ctx_map.size() * ml.files.size();
@@ -1918,32 +1910,30 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
         std::vector<ggml_backend_buffer_ptr> bufs;
 
-        // Large pinned host allocations physically populate RAM before returning.
-        // Defer them until device uploads finish, then overlap each bounded
-        // allocation with the preceding batch's disk read. Other buffer types
-        // and mapped/locked/custom loading keep their existing path.
-        bool pipeline = load_batch_size && !ml.no_alloc && !ml.use_mmap && !use_mlock &&
-                !ctx_key.lazy && !ml.files.empty() &&
-                ggml_backend_buft_is_host(buft) && !is_default_buft &&
-                buft == ggml_backend_dev_host_buffer_type(dev);
-        if (pipeline) {
-            for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
-                if (t->view_src || t->data || !ml.get_weight(t->name)) {
-                    pipeline = false;
-                    break;
-                }
-            }
-        }
-        if (pipeline) {
-            pipelined_contexts.emplace_back(pimpl->ctxs_bufs.size(), buft);
-            pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
+        bool pipeline=load_batch_size && !dsv4f_direct_weights_enabled() && !ml.no_alloc &&
+            !ml.use_mmap && !use_mlock && !ctx_key.lazy && !ctx_key.direct && !ml.files.empty() &&
+            ggml_backend_buft_is_host(buft) && (buft==ggml_backend_cpu_buffer_type() ||
+                buft==ggml_backend_dev_host_buffer_type(dev)) &&
+            ggml_backend_alloc_ctx_tensors_from_buft_size(ctx,buft)>0;
+        if(pipeline)for(auto * t=ggml_get_first_tensor(ctx);t;t=ggml_get_next_tensor(ctx,t))
+            if(t->view_src || t->data || !ml.get_weight(t->name)){pipeline=false;break;}
+        if(pipeline) {
+            pipelined_contexts.emplace_back(pimpl->ctxs_bufs.size(),buft);
+            pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr),std::move(bufs));
             continue;
         }
 
         // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing
         const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
 
-        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+        if (ctx_key.direct && !ml.no_alloc) {
+            std::vector<dsv4f_direct_tensor> tensors;
+            for (auto * t=ggml_get_first_tensor(ctx); t; t=ggml_get_next_tensor(ctx,t)) {
+                const auto & w=ml.require_weight(t->name);
+                tensors.push_back({t,ml.files.at(w.idx)->file_id(),w.offs,w.idx});
+            }
+            bufs.emplace_back(dsv4f_direct_weights_buffer(tensors));
+        } else if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
@@ -1966,7 +1956,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         } else {
             ggml_backend_buffer_t buf;
-            if (ml.no_alloc) {
+            if (ml.no_alloc || ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, buft) == 0) {
                 buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
                 for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
@@ -2038,25 +2028,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // load tensor data
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
+        // Direct expert descriptors already reference the SSD source; no full tensor read.
+        if (buf_map.empty() && ggml_get_first_tensor(ctx) && ggml_get_first_tensor(ctx)->data) {
+            continue;
+        }
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
     }
 
-    for (auto & [idx, buft] : pipelined_contexts) {
-        auto & entry = pimpl->ctxs_bufs[idx];
-        LLAMA_LOG_INFO("%s: pipelined %s weight allocation/loading, batch = %.0f MiB (at least one tensor)\n",
-                __func__, ggml_backend_buft_name(buft), load_batch_size / 1024.0 / 1024.0);
-        if (!ml.load_host_data_pipelined(entry.first.get(), buft, entry.second, load_batch_size,
-                params.progress_callback, params.progress_callback_user_data)) {
-            return false;
-        }
-        size_t bytes = 0;
-        for (const auto & buf : entry.second) {
-            bytes += ggml_backend_buffer_get_size(buf.get());
-        }
-        LLAMA_LOG_INFO("%s: %12s model buffer size = %8.2f MiB in %zu batches\n",
-                __func__, ggml_backend_buft_name(buft), bytes / 1024.0 / 1024.0, entry.second.size());
+    for(const auto & item:pipelined_contexts) {
+        auto & entry=pimpl->ctxs_bufs[item.first];
+        LLAMA_LOG_INFO("[dsv4f-load] pipelined %s allocation/read: batch=%.0f MiB (at least one tensor)\n",
+            ggml_backend_buft_name(item.second),load_batch_size/1048576.);
+        if(!ml.load_host_data_pipelined(entry.first.get(),item.second,entry.second,load_batch_size,
+            params.progress_callback,params.progress_callback_user_data))return false;
+        size_t bytes=0;for(const auto & buffer:entry.second)bytes+=ggml_backend_buffer_get_size(buffer.get());
+        LLAMA_LOG_INFO("%s: %12s model buffer size = %8.2f MiB in %zu batches\n",__func__,
+            ggml_backend_buft_name(item.second),bytes/1048576.,entry.second.size());
     }
 
     if (use_mmap_buffer) {
@@ -2118,6 +2107,13 @@ uint32_t llama_model::n_gpu_layers() const {
 
 llama_split_mode llama_model::split_mode() const {
     return params.split_mode;
+}
+
+void llama_model::add_constant_buffer(ggml_context_ptr ctx, ggml_backend_buffer_ptr buffer) {
+    ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    std::vector<ggml_backend_buffer_ptr> bufs;
+    bufs.emplace_back(std::move(buffer));
+    pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(bufs));
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {

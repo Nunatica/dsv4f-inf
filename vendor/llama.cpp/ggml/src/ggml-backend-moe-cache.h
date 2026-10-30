@@ -110,6 +110,8 @@ struct ggml_dsv4f_expert_api {
     // available headroom, and discard backend graphs/temporary allocations.
     bool (*gpu_resize)(bool decode);
     void (*gpu_trim_workspace)(ggml_backend_t backend);
+    void (*gpu_drain)();
+    size_t (*gpu_warm_start)();
 };
 typedef void (*ggml_dsv4f_cpu_fn)(const struct ggml_tensor *, const struct ggml_tensor *, const struct ggml_tensor *,
                                  const float *, const int32_t *, const float *, int, uint64_t, float, float *);
@@ -119,6 +121,59 @@ GGML_BACKEND_API ggml_dsv4f_cpu_fn ggml_dsv4f_cpu_experts;
 #define GGML_DSV4F_ROUTER_TAG 0x44535636
 GGML_BACKEND_API struct ggml_dsv4f_expert_api ggml_dsv4f_experts;
 
+// Optional process-local routing history, owned by the engine. Handles remain
+// valid until model unload. A row identifies a layer + expert format; projection
+// tensors share the same row. Observe actual routes once, never weight copies.
+struct ggml_dsv4f_routing_api {
+    void * (*bind)(const struct ggml_tensor *);
+    void (*observe)(void *, const int32_t *, const float *, int);
+    intptr_t (*count)(const void *, int);
+};
+GGML_BACKEND_API struct ggml_dsv4f_routing_api ggml_dsv4f_routing;
+
+
 #ifdef __cplusplus
 }
+#endif
+
+// Direct SSD/RAM expert source. Leases keep host bytes alive through CPU work or DMA.
+struct ggml_dsv4f_host_weights_stats {
+    uint64_t resident_bytes, transient_bytes, reads, read_bytes, evictions;
+    uint64_t transient_reads, transient_read_bytes;
+};
+struct ggml_dsv4f_host_weights_api {
+    const void * (*acquire)(const void *, size_t);
+    void (*release)(const void *);
+    // Non-blocking hint. The direct-weight backend may populate its RAM cache
+    // in the background; resident backends leave this null.
+    void (*prefetch)(const void *, size_t);
+    // All-or-nothing batch of complete expert-plane leases. Cold planes can
+    // read concurrently into their final RAM-cache allocations (no bounce).
+    void (*acquire_many)(const void * const *, const size_t *, const void **, size_t);
+    // Prefill scan: preserve resident weights, bypass admission on overflow.
+    // Transient allocations remain leased through H2D, then return to the OS.
+    void (*acquire_prefill)(const void * const *, const size_t *, const void **, size_t);
+    void (*statistics)(struct ggml_dsv4f_host_weights_stats *);
+    // Snapshot complete-plane residency without touching LRU or reading SSD.
+    void (*resident_many)(const void * const *, const size_t *, bool *, size_t);
+    // Hand a plane to the GPU cache. Live CPU/DMA leases remain valid, but
+    // its RAM copy is removed at the last release (or immediately if idle).
+    void (*discard)(const void *, size_t);
+};
+#ifdef __cplusplus
+extern "C" {
+#endif
+GGML_BACKEND_API struct ggml_dsv4f_host_weights_api ggml_dsv4f_host_weights;
+#ifdef __cplusplus
+}
+#endif
+#ifdef __cplusplus
+struct ggml_dsv4f_host_lease {
+    const void * data;
+    explicit ggml_dsv4f_host_lease(const void * p, size_t n) :
+        data(ggml_dsv4f_host_weights.acquire ? ggml_dsv4f_host_weights.acquire(p,n) : p) {}
+    ~ggml_dsv4f_host_lease(){if(ggml_dsv4f_host_weights.release)ggml_dsv4f_host_weights.release(data);}
+    ggml_dsv4f_host_lease(const ggml_dsv4f_host_lease &) = delete;
+    ggml_dsv4f_host_lease & operator=(const ggml_dsv4f_host_lease &) = delete;
+};
 #endif

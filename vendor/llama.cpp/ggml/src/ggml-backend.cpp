@@ -19,6 +19,8 @@
 // init when GGML_CUDA_MOE_CACHE=1, consumed by the CPU mul_mat_id kernel.
 struct ggml_moe_cache_api ggml_moe_cache = {};
 struct ggml_dsv4f_expert_api ggml_dsv4f_experts = {};
+struct ggml_dsv4f_routing_api ggml_dsv4f_routing = {};
+struct ggml_dsv4f_host_weights_api ggml_dsv4f_host_weights = {};
 ggml_dsv4f_cpu_fn ggml_dsv4f_cpu_experts = nullptr;
 
 #include <assert.h>

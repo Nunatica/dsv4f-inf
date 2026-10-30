@@ -1,6 +1,38 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# Zero keeps the original resident loader; a positive process-tree budget enables tiering.
+export DSV4F_RAM_BUDGET_MIB=${DSV4F_RAM_BUDGET_MIB:-0}
+export DSV4F_RAM_RESERVE_MIB=${DSV4F_RAM_RESERVE_MIB:-1024}
+export DSV4F_RAM_UNLOCK_IO=${DSV4F_RAM_UNLOCK_IO:-1}
+case "$DSV4F_RAM_UNLOCK_IO" in 0|1) ;; *) echo 'DSV4F_RAM_UNLOCK_IO must be 0 or 1.' >&2; exit 1;; esac
+export DSV4F_ADAPTIVE_ROUTING=${DSV4F_ADAPTIVE_ROUTING:-0}
+case "$DSV4F_ADAPTIVE_ROUTING" in 0|1) ;; *) echo 'DSV4F_ADAPTIVE_ROUTING must be 0 or 1.' >&2; exit 1;; esac
+export DSV4F_ADAPTIVE_PRUNING=${DSV4F_ADAPTIVE_PRUNING:-0}
+if [[ ! $DSV4F_ADAPTIVE_PRUNING =~ ^(0|[1-9]|[1-4][0-9]|50)$ ]]; then
+    echo 'DSV4F_ADAPTIVE_PRUNING must be an integer in 0..50.' >&2; exit 1
+fi
+if [[ $DSV4F_ADAPTIVE_ROUTING == 1 && $DSV4F_ADAPTIVE_PRUNING != 0 ]]; then
+    echo 'DSV4F_ADAPTIVE_ROUTING and DSV4F_ADAPTIVE_PRUNING cannot both be enabled; set DSV4F_ADAPTIVE_ROUTING=0.' >&2; exit 1
+fi
+export DSV4F_RAM_PRELOAD=${DSV4F_RAM_PRELOAD:-0}
+case "$DSV4F_RAM_PRELOAD" in 0|1) ;; *) echo 'DSV4F_RAM_PRELOAD must be 0 or 1.' >&2; exit 1;; esac
+for name in DSV4F_RAM_BUDGET_MIB DSV4F_RAM_RESERVE_MIB; do
+    value=${!name}
+    if [[ ! $value =~ ^[0-9]{1,10}$ ]] || ((10#$value > 16777216)); then
+        echo "$name must be an integer in 0..16777216 MiB." >&2; exit 1
+    fi
+done
+ram_budget_mib=$((10#$DSV4F_RAM_BUDGET_MIB))
+if ((ram_budget_mib && ram_budget_mib <= 10#$DSV4F_RAM_RESERVE_MIB + 64)); then
+    echo 'RAM budget must exceed RAM reserve by more than 64 MiB.' >&2; exit 1
+fi
+if [[ -v DSV4F_RAM_CACHE_MIB ]]; then
+    if [[ ! $DSV4F_RAM_CACHE_MIB =~ ^[0-9]{1,10}$ ]] || ((10#$DSV4F_RAM_CACHE_MIB < 64 || 10#$DSV4F_RAM_CACHE_MIB > 16777216)); then
+        echo 'DSV4F_RAM_CACHE_MIB must be an integer in 64..16777216 MiB.' >&2; exit 1
+    fi
+    export DSV4F_RAM_CACHE_MIB
+fi
 export MODEL="${MODEL:-$ROOT/models/DeepSeek-V4-Flash-Vision-Exp-UD-Q4_K_XL-00001-of-00005.gguf}"
 export CTX_SIZE=${CTX_SIZE:-262144}
 export DSV4F_KV_RESIDENT=${DSV4F_KV_RESIDENT:-65536}
@@ -35,7 +67,9 @@ export DSV4F_BATCH_TRANSFERS=${DSV4F_BATCH_TRANSFERS:-1}
 export DSV4F_GPU_JOIN=${DSV4F_GPU_JOIN:-1}
 export DSV4F_PINNED_COMPUTE=${DSV4F_PINNED_COMPUTE:-1}
 export DSV4F_PINNED_WEIGHTS=${DSV4F_PINNED_WEIGHTS:-$DSV4F_PINNED_COMPUTE}
-export DSV4F_LOAD_MODE=${DSV4F_LOAD_MODE:-dio}
+if ((ram_budget_mib)); then export DSV4F_PINNED_WEIGHTS=0; fi
+export DSV4F_LOAD_MODE=${DSV4F_LOAD_MODE:-none}
+if ((ram_budget_mib)); then export DSV4F_LOAD_MODE=dio; fi
 case "$DSV4F_LOAD_MODE" in none|dio) ;; *) echo 'DSV4F_LOAD_MODE must be none or dio.' >&2; exit 1;; esac
 export DSV4F_LOAD_PIPELINE_MIB=${DSV4F_LOAD_PIPELINE_MIB:-1024}
 if [[ ! $DSV4F_LOAD_PIPELINE_MIB =~ ^[0-9]{1,5}$ ]] || ((10#$DSV4F_LOAD_PIPELINE_MIB > 65536)); then
@@ -74,6 +108,10 @@ if [[ ! $DSV4F_PREFILL_GROUP =~ ^[0-9]{1,3}$ ]] || ((10#$DSV4F_PREFILL_GROUP < 1
     echo 'DSV4F_PREFILL_GROUP must be an integer in 1..256.' >&2; exit 1
 fi
 export DSV4F_PHASE_WORKSPACE=${DSV4F_PHASE_WORKSPACE:-1}
+if ((ram_budget_mib)); then
+    export DSV4F_PHASE_WORKSPACE=1
+    export BATCH_SIZE=1024 UBATCH_SIZE=1024
+fi
 export DSV4F_DECODE_BATCH=${DSV4F_DECODE_BATCH:-512}
 export DSV4F_DECODE_UBATCH=${DSV4F_DECODE_UBATCH:-256}
 export DSV4F_CACHE_POLICY=${DSV4F_CACHE_POLICY:-aged}
@@ -112,7 +150,7 @@ args=(--model "$MODEL" --ctx-size "$CTX_SIZE" --cache-type-k q8_0 --cache-type-v
       --load-mode "$DSV4F_LOAD_MODE" --lazy-mode off --no-repack --cpu-moe --n-gpu-layers 999 --fit off
       --threads "$DSV4F_CPU_THREADS" --threads-batch "$DSV4F_CPU_THREADS"
       --batch-size "${BATCH_SIZE:-5120}" --ubatch-size "${UBATCH_SIZE:-5120}"
-      --flash-attn on --parallel 1 --host "$HOST" --port "$PORT" --api-key "$API_KEY"
+      --flash-attn on --parallel 1 --cache-ram 0 --host "$HOST" --port "$PORT" --api-key "$API_KEY"
       --jinja --reasoning off --reasoning-budget 0 --no-context-shift
       --alias dsv4f --ui --path "$ROOT/web")
 if [[ $DSV4F_PINNED_WEIGHTS == 0 ]]; then args+=(--no-host); fi
@@ -125,15 +163,28 @@ fi
 if [[ -n ${MMPROJ:-} ]]; then args+=(--mmproj "$MMPROJ"); fi
 if [[ ${1:-} == --dry-run ]]; then
     python3 "$ROOT/scripts/model_info.py" "$MODEL"
+    echo "RAM budget: $ram_budget_mib MiB; SSD payload I/O: $([[ $ram_budget_mib == 0 ]] && echo resident || echo O_DIRECT)"
+    echo "Adaptive expert routing: $DSV4F_ADAPTIVE_ROUTING"
+    echo "Adaptive expert pruning: $DSV4F_ADAPTIVE_PRUNING% routed expert memory target"
+    echo "Expert RAM preload: $DSV4F_RAM_PRELOAD (requires a positive RAM budget)"
     printf '%q ' "$BUILD_DIR/bin/dsv4f-server" "${args[@]}" "${@:2}"
     printf '\n'
     exit 0
 fi
-if ! python3 "$ROOT/scripts/model_info.py" --swap-check; then
-    if command -v systemd-run >/dev/null; then
-        exec systemd-run --user --scope --quiet --unit="dsv4f-$$" -p MemorySwapMax=0 "$ROOT/run-server.sh" "$@"
+if ! python3 "$ROOT/scripts/memory_budget.py" --check; then
+    if [[ ${DSV4F_SCOPE_REQUESTED:-0} == 1 ]]; then
+        echo 'Requested cgroup RAM/swap limits were not applied; refusing an unbounded launch.' >&2; exit 1
     fi
-    echo 'Cannot forbid swap. Disable system swap (sudo swapoff -a) or enable user systemd cgroups.' >&2
+    if command -v systemd-run >/dev/null; then
+        scope_args=(-p MemorySwapMax=0)
+        if ((ram_budget_mib)); then
+            scope_args+=(-p "MemoryMax=$((ram_budget_mib * 1048576))"
+                         -p "MemoryHigh=$(((ram_budget_mib - 10#$DSV4F_RAM_RESERVE_MIB / 2) * 1048576))")
+        fi
+        export DSV4F_SCOPE_REQUESTED=1
+        exec systemd-run --user --scope --quiet --unit="dsv4f-$$" "${scope_args[@]}" "$ROOT/run-server.sh" "$@"
+    fi
+    echo 'Cannot enforce RAM/swap limits. A systemd user session with cgroup v2 memory control is required.' >&2
     exit 1
 fi
 [[ -x "$BUILD_DIR/bin/dsv4f-server" ]] || "$ROOT/build-engine.sh"

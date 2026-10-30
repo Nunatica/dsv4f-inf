@@ -1,3 +1,4 @@
+#include "direct-weights.h"
 #include "server-task.h"
 
 #include "build-info.h"
@@ -1725,9 +1726,11 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     // calculate checkpoints size to see if it will fit with the prompt
     size_t checkpoints_size = 0;
     for (const auto & ckpt : prompt.checkpoints) {
+        if(ckpt.size()>SIZE_MAX-checkpoints_size)return nullptr;
         checkpoints_size += ckpt.size();
     }
 
+    if(state_size_dft>SIZE_MAX-state_size_tgt || checkpoints_size>SIZE_MAX-state_size_tgt-state_size_dft)return nullptr;
     const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
 
     // skip over-limit entries to avoid disturbing the cache
@@ -1762,6 +1765,9 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
     std::vector<uint8_t> state_data_tgt;
     std::vector<uint8_t> state_data_dft;
+
+    dsv4f_ram_reservation ram(state_size_new);
+    if(!ram){SRV_WRN("%s","skipping prompt cache: RAM budget exhausted\n");return nullptr;}
 
     // check if we can allocate enough memory for the new state
     try {

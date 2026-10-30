@@ -2273,12 +2273,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     }
 
+    if(arch==LLM_ARCH_DEEPSEEK4 && dsv4f_expert_maps.count(gate_exps)) {
+        selected_experts=ggml_reshape_2d(ctx0,ggml_get_rows(ctx0,ggml_repeat_4d(ctx0,dsv4f_expert_maps.at(gate_exps),1,n_expert,n_tokens,1),selected_experts),n_expert_used,n_tokens);
+    }
     const char * whole = std::getenv("DSV4F_WHOLE_EXPERT");
     const char * prefill_env = std::getenv("DSV4F_PREFILL_STREAM");
+    const bool direct_experts=ggml_dsv4f_host_weights.acquire!=nullptr;
     const bool stream_prefill = prefill_env && std::atoi(prefill_env) != 0 && n_tokens >= 32 && !cparams.cb_eval &&
         gate_exps && up_exps && down_exps && gate_exps->type == GGML_TYPE_MXFP4 &&
         up_exps->type == GGML_TYPE_MXFP4 && down_exps->type == GGML_TYPE_MXFP4;
-    if (arch == LLM_ARCH_DEEPSEEK4 && n_tokens >= 1 && (n_tokens <= 4 || stream_prefill) && (!whole || std::atoi(whole) != 0) &&
+    if (arch == LLM_ARCH_DEEPSEEK4 && n_tokens >= 1 && (n_tokens <= 4 || stream_prefill || direct_experts) && (direct_experts || !whole || std::atoi(whole) != 0) &&
         (!loras || loras->empty()) && gate_exps && up_exps && down_exps && !gate_up_exps &&
         gate_exps->buffer && ggml_backend_buffer_is_host(gate_exps->buffer) &&
         up_exps->buffer && ggml_backend_buffer_is_host(up_exps->buffer) &&
@@ -2288,7 +2292,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         const float limit = hparams.swiglu_clamp_exp[il] > 1e-6f ? hparams.swiglu_clamp_exp[il] : INFINITY;
         auto * result = dsv4f_moe(ctx0, ggml_cont(ctx0, cur), selected_experts, weights, gate_exps, up_exps, down_exps, limit,
                                  stream_prefill ? &dsv4f_prefill_scratch : nullptr);
-        if (!stream_prefill || (ggml_dsv4f_experts.gpu_supported && ggml_dsv4f_experts.gpu_supported(result))) {
+        if (direct_experts || !stream_prefill || (ggml_dsv4f_experts.gpu_supported && ggml_dsv4f_experts.gpu_supported(result))) {
             cb(result, stream_prefill ? "ffn_moe_prefill" : "ffn_moe_whole_expert", il);
             return result;
         }

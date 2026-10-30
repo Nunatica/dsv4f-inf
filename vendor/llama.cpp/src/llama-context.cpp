@@ -1,3 +1,4 @@
+#include "direct-weights.h"
 #include "llama-context.h"
 
 #include "ggml.h"
@@ -253,9 +254,15 @@ llama_context::llama_context(
 
     prefill_batch=cparams.n_batch;prefill_ubatch=cparams.n_ubatch;
     const char * phase_env=std::getenv("DSV4F_PHASE_WORKSPACE");
-    phase_workspace=phase_env && std::atoi(phase_env)!=0 && model.arch==LLM_ARCH_DEEPSEEK4 &&
+    const bool dsv4_workspace=model.arch==LLM_ARCH_DEEPSEEK4 &&
         (params.ctx_type==LLAMA_CONTEXT_TYPE_DEFAULT || params.ctx_type==LLAMA_CONTEXT_TYPE_MTP) && params.n_seq_max==1 &&
         cparams.causal_attn && !model.hparams.no_alloc;
+    const bool tiered_workspace=dsv4_workspace && dsv4f_ram_budget()!=0;
+    if(tiered_workspace) {
+        cparams.n_batch=prefill_batch=std::min(prefill_batch,1024u);
+        cparams.n_ubatch=prefill_ubatch=std::min(prefill_ubatch,cparams.n_batch);
+    }
+    phase_workspace=dsv4_workspace && phase_env && std::atoi(phase_env)!=0;
     if(phase_workspace) {
         auto limit=[](const char * name,uint32_t fallback) {
             const char * text=std::getenv(name);if(!text)return fallback;
@@ -264,8 +271,9 @@ llama_context::llama_context(
                 throw std::runtime_error(std::string("invalid decode batch limit: ")+name);
             return uint32_t(value);
         };
-        decode_batch=std::min(prefill_batch,limit("DSV4F_DECODE_BATCH",512));
+        decode_batch=tiered_workspace?prefill_batch:std::min(prefill_batch,limit("DSV4F_DECODE_BATCH",512));
         decode_ubatch=std::min({prefill_ubatch,decode_batch,limit("DSV4F_DECODE_UBATCH",256)});
+        if(tiered_workspace)decode_batch=decode_ubatch;
     }
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;

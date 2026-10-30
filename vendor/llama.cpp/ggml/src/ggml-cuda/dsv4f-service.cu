@@ -3,6 +3,8 @@
 #include "dsv4f-memory.cuh"
 #include "ggml-backend-moe-cache.h"
 #include "../ggml-dsv4f-cache-policy.h"
+#include "../ggml-dsv4f-routing.h"
+#include "../ggml-dsv4f-warm-start.h"
 #include "mmvq.cuh"
 #include "quantize.cuh"
 #include "vecdotq.cuh"
@@ -156,7 +158,10 @@ __global__ void mxfp4_down_sum(const char * const * cache,size_t down_offset,con
     __syncthreads();if(threadIdx.x<4){float v=0;for(int e=0;e<nk;++e)if(plan[e]>=0)v+=weights[e]*parts[e][threadIdx.x];out[row0+threadIdx.x]=v;}
 }
 
-struct descriptor {ggml_tensor g,u,d;};
+struct descriptor {ggml_tensor g{},u{},d{}; void * routing=nullptr;
+    descriptor()=default;
+    descriptor(const ggml_tensor & gate,const ggml_tensor & up,const ggml_tensor & down):g(gate),u(up),d(down),routing(ggml_dsv4f_routing_bind(&gate)){}
+};
 struct job {int slot,key,old_key;};
 class service {
     std::mutex mutex,answer_mutex;
@@ -224,6 +229,7 @@ class service {
             idle=0;std::atomic_thread_fence(std::memory_order_acquire);
             descriptor layer;
             {std::lock_guard<std::mutex> lock(mutex);layer=layers[r->layer];}
+            ggml_dsv4f_routing_observe(layer.routing,r->ids,r->weights,r->nk);
             const bool observation=r->kind==2;
             if(!observation) {
                 const auto start=std::chrono::steady_clock::now();
@@ -254,10 +260,11 @@ class service {
             reserve_slot<<<1,32,0,copy>>>(readers,table,j.slot,j.old_key,claim_d);CUDA_CHECK(cudaGetLastError());CUDA_CHECK(cudaStreamSynchronize(copy));
             const bool success=*claim_h!=0;
             if(success){const int eid=j.key%MAX_EXPERTS;
+                ggml_dsv4f_host_lease g((const char*)l.g.data+eid*gs,gs),u((const char*)l.u.data+eid*us,us),d((const char*)l.d.data+eid*ds,ds);
                 char * dest=fused_mxfp4?cache_ptrs[j.slot]:slab+j.slot*stride;
-                CUDA_CHECK(cudaMemcpyAsync(dest,(const char*)l.g.data+eid*gs,gs,cudaMemcpyHostToDevice,copy));
-                CUDA_CHECK(cudaMemcpyAsync(dest+uo,(const char*)l.u.data+eid*us,us,cudaMemcpyHostToDevice,copy));
-                CUDA_CHECK(cudaMemcpyAsync(dest+doff,(const char*)l.d.data+eid*ds,ds,cudaMemcpyHostToDevice,copy));
+                CUDA_CHECK(cudaMemcpyAsync(dest,g.data,gs,cudaMemcpyHostToDevice,copy));
+                CUDA_CHECK(cudaMemcpyAsync(dest+uo,u.data,us,cudaMemcpyHostToDevice,copy));
+                CUDA_CHECK(cudaMemcpyAsync(dest+doff,d.data,ds,cudaMemcpyHostToDevice,copy));
                 publish_slot<<<1,32,0,copy>>>(readers,table,j.slot,j.key);CUDA_CHECK(cudaGetLastError());CUDA_CHECK(cudaStreamSynchronize(copy));
             }
             lock.lock();if(success){policy.publish(j.slot,j.key);++admissions;admit_bytes+=gs+us+ds;}slots[j.slot].ready=true;pending.erase(j.key);copies.notify_all();
@@ -308,6 +315,11 @@ class service {
             if(end==value || *end || !std::isfinite(ratio) || ratio<1 || ratio>16)throw std::runtime_error("invalid DSV4F_CACHE_REPLACE_RATIO");
         }
         policy.configure(selected,43ULL*decay,ratio);
+        policy.history_context=this;
+        policy.history_score=[](void * ctx,int key)->uint64_t {
+            auto & self=*static_cast<service *>(ctx);const size_t layer=key/MAX_EXPERTS;
+            return layer<self.layers.size()?ggml_dsv4f_routing_bonus(ggml_dsv4f_routing_count(self.layers[layer].routing,key%MAX_EXPERTS)):0;
+        };
         std::fprintf(stderr,"[dsv4f-service] cache_policy=%s decay_tokens=%u replacement_ratio=%.3f\n",cache_mode,decay,ratio);
         if(const char * path=std::getenv("DSV4F_CACHE_TRACE")) {
             trace=std::fopen(path,"w");if(!trace)throw std::runtime_error("cannot open DSV4F_CACHE_TRACE");
@@ -367,6 +379,45 @@ public:
         if(configured)return gt==g->type && ut==u->type && dt==d->type && ne==g->ne[0] && nf==g->ne[1] && gs==g->nb[2] && us==u->nb[2] && ds==d->nb[2];
         selected_source=g->data;configured=true;gt=g->type;ut=u->type;dt=d->type;ne=g->ne[0];nf=g->ne[1];gs=g->nb[2];us=u->nb[2];ds=d->nb[2];return true;
     }
+    size_t warm_start() {
+        if(!host || slots.empty() || prefill_leased || !ggml_dsv4f_routing.count)return 0;
+        ggml_cuda_set_device(0);drain();
+        std::unique_lock<std::mutex> lock(mutex);
+        copies.wait(lock,[&]{return pending.empty();});
+        CUDA_CHECK(cudaStreamSynchronize(copy));
+        std::vector<ggml_dsv4f_warm_candidate> candidates;
+        for(size_t layer=0;layer<layers.size();++layer) {
+            const auto & l=layers[layer];
+            for(int e=0;e<l.g.ne[2];++e) {
+                const auto count=ggml_dsv4f_routing_count(l.routing,e);
+                if(count>0)candidates.push_back({int(layer)*MAX_EXPERTS+e,count});
+            }
+        }
+        const auto plan=ggml_dsv4f_warm_start_plan(policy,std::move(candidates));
+        size_t loaded=0;
+        for(const auto & item:plan) {
+            const auto & l=layers[item.key/MAX_EXPERTS];const int e=item.key%MAX_EXPERTS;
+            // Acquire payloads before invalidating the old GPU lookup. An I/O
+            // failure leaves that slot intact and propagates to model startup.
+            ggml_dsv4f_host_lease g((const char*)l.g.data+e*gs,gs);
+            ggml_dsv4f_host_lease u((const char*)l.u.data+e*us,us);
+            ggml_dsv4f_host_lease d((const char*)l.d.data+e*ds,ds);
+            const int old_key=slots[item.slot].key;
+            reserve_slot<<<1,32,0,copy>>>(readers,table,item.slot,old_key,claim_d);
+            CUDA_CHECK(cudaGetLastError());CUDA_CHECK(cudaStreamSynchronize(copy));
+            if(!*claim_h)continue;
+            char * dest=fused_mxfp4?cache_ptrs[item.slot]:slab+item.slot*stride;
+            CUDA_CHECK(cudaMemcpyAsync(dest,g.data,gs,cudaMemcpyHostToDevice,copy));
+            CUDA_CHECK(cudaMemcpyAsync(dest+uo,u.data,us,cudaMemcpyHostToDevice,copy));
+            CUDA_CHECK(cudaMemcpyAsync(dest+doff,d.data,ds,cudaMemcpyHostToDevice,copy));
+            publish_slot<<<1,32,0,copy>>>(readers,table,item.slot,item.key);
+            CUDA_CHECK(cudaGetLastError());CUDA_CHECK(cudaStreamSynchronize(copy));
+            policy.publish(item.slot,item.key);++loaded;
+        }
+        if(loaded)std::fprintf(stderr,"[dsv4f-vram-preload] format=%s experts=%zu payload=%.2f MiB slots=%zu order=routing-count\n",
+            ggml_type_name(gt),loaded,loaded*(gs+us+ds)/1048576.,slots.size());
+        return loaded;
+    }
     void statistics(uint64_t * r,uint64_t * h,uint64_t * a){std::lock_guard<std::mutex> lock(mutex);*r=routes;*h=hits;*a=admissions;}
     void grow_cache() {
         // Cap each block at 64 MiB (or one complete expert) so small temporary
@@ -385,6 +436,7 @@ public:
         slots.resize(cache_ptrs.size());
     }
     void drain() {
+        if(!host)return;
         CUDA_CHECK(cudaDeviceSynchronize());
         for(int i=0;i<RING;++i)while(host[i].consumed!=host[i].seq)std::this_thread::yield();
     }
@@ -660,6 +712,8 @@ void ggml_dsv4f_service_finalize(void * ctx,ggml_tensor * node){instance().finis
 void ggml_dsv4f_service_invalidate(const void * base,size_t bytes){instance().invalidate(base,bytes);}
 
 void ggml_dsv4f_service_statistics(uint64_t * r,uint64_t * h,uint64_t * a){instance().statistics(r,h,a);}
+void ggml_dsv4f_service_drain(){instance().drain();}
+size_t ggml_dsv4f_service_warm_start(){return instance().warm_start();}
 bool ggml_dsv4f_service_resize(bool decode){return instance().resize(decode);}
 bool ggml_dsv4f_prefill_cache_begin(const ggml_tensor * g, const ggml_tensor * u,
     const ggml_tensor * d, int nk, int group, std::vector<int> & active,

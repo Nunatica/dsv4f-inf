@@ -1,3 +1,5 @@
+#include "direct-weights.h"
+#include "routing-table.h"
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
@@ -1232,6 +1234,8 @@ private:
         if (deferred_warmup) server_vram_snapshot("startup");
         const bool requested_warmup = params_base.warmup;
         if (deferred_warmup) params_base.warmup = false;
+        try {dsv4f_routing_init(params_base.model.path);}
+        catch(const std::exception & e){SRV_ERR("adaptive routing initialization failed: %s\n",e.what());return false;}
         llama_init = common_init_from_params(params_base);
         params_base.warmup = requested_warmup;
 
@@ -1555,6 +1559,9 @@ private:
             }
             server_vram_snapshot("ready");
         }
+
+        try {dsv4f_preload_experts();dsv4f_routing_start();}
+        catch(const std::exception & e){SRV_ERR("expert startup preload failed: %s\n",e.what());return false;}
 
         // propagate new defaults back to caller
         params = params_base;
@@ -2263,6 +2270,7 @@ private:
     }
 
     void send_final_response(server_slot & slot) {
+        dsv4f_routing_save();
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = slot.task->id;
@@ -2608,6 +2616,10 @@ private:
             }
         }
 
+        const size_t tgt_bytes=llama_state_seq_get_size_ext(ctx_tgt,slot.id,LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        const size_t dft_bytes=ctx_dft?llama_state_seq_get_size_ext(ctx_dft,slot.id,LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY):0;
+        dsv4f_ram_reservation ram(tgt_bytes+dft_bytes);
+        if(!ram){SLT_WRN(slot,"%s","skipping checkpoint: RAM budget exhausted\n");return;}
         auto & cur = slot.prompt.checkpoints.emplace_back();
 
         cur.id_task = id_task;
@@ -2647,6 +2659,8 @@ private:
         if (!ckpt_read(ifs, &n, sizeof(n), n_read) || n > n_avail - n_read) {
             return false;
         }
+        dsv4f_ram_reservation ram(n>buf.capacity()?n:0);
+        if(!ram)return false;
         buf.resize(n);
         return n == 0 || ckpt_read(ifs, buf.data(), n, n_read);
     }

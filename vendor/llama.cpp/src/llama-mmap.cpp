@@ -290,6 +290,10 @@ struct llama_file::impl {
                     }
                     // Fallback to std::fread in case the DMA controller cannot access the buffer
                     if (errno == EFAULT || errno == EINVAL) {
+                        const char * budget = std::getenv("DSV4F_RAM_BUDGET_MIB");
+                        if (budget && std::strtoull(budget, nullptr, 10)) {
+                            throw std::runtime_error(format("O_DIRECT failed: %s; RAM budget forbids buffered fallback", strerror(errno)));
+                        }
                         LLAMA_LOG_WARN("%s: Falling back to buffered IO due to %s\n", __func__, strerror(errno));
                         auto curr_off = tell();
                         close(fd);
@@ -352,6 +356,9 @@ struct llama_file::impl {
             skip    = 0;
             done   += n;
         }
+        // Expose the logical cursor, not the end of the aligned read-ahead sector.
+        // Consecutive payload chunks (e.g. MTP) can start at unaligned offsets.
+        seek(offset + size, SEEK_SET);
     }
 
     void read_raw(void * ptr, size_t len) {

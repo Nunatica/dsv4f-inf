@@ -8,10 +8,75 @@
 
 #include <chrono>
 #include <cstring>
+#include <memory>
 #include <numeric>
 #include <vector>
 
 namespace {
+// Keep direct-RAM entries alive until every H2D in a prefill group has consumed
+// them. The legacy path synchronizes and releases after each expert/plane. The
+// grouped path queues one host callback after the group's ready event, removing
+// dozens of host-side stream synchronizations without weakening cache leases.
+class prefill_host_leases {
+    struct retired {
+        void (*release)(const void *);
+        std::vector<const void *> pointers;
+    };
+    bool grouped;
+    cudaStream_t copy;
+    void (*release_fn)(const void *)=ggml_dsv4f_host_weights.release;
+    std::vector<const void *> held;
+    std::vector<const void *> prepared;
+    static void release_callback(void * opaque) {
+        std::unique_ptr<retired> batch((retired *)opaque);
+        for(const void * p:batch->pointers)batch->release(p);
+    }
+    void release_now() {
+        for(const void * p:held)release_fn(p);
+        held.clear();
+    }
+public:
+    explicit prefill_host_leases(bool enable,cudaStream_t stream,size_t capacity):grouped(enable),copy(stream) {
+        if(ggml_dsv4f_host_weights.acquire)held.reserve(capacity);
+    }
+    prefill_host_leases(const prefill_host_leases &)=delete;
+    prefill_host_leases & operator=(const prefill_host_leases &)=delete;
+    ~prefill_host_leases(){
+        // An acquire/allocation exception must not unpin sources of already
+        // queued copies. Normal retirement transfers ownership to the callback.
+        if(!held.empty()){CUDA_CHECK(cudaStreamSynchronize(copy));release_now();}
+    }
+    void prepare(const std::vector<const void *> & pointers,const std::vector<size_t> & sizes) {
+        GGML_ASSERT(grouped && held.empty() && ggml_dsv4f_host_weights.acquire_many);
+        prepared=pointers;held.resize(pointers.size());
+        const auto acquire=ggml_dsv4f_host_weights.acquire_prefill?
+            ggml_dsv4f_host_weights.acquire_prefill:ggml_dsv4f_host_weights.acquire_many;
+        try{acquire(pointers.data(),sizes.data(),held.data(),pointers.size());}
+        catch(...){held.clear();prepared.clear();throw;}
+    }
+    const void * acquire(const void * p,size_t n) {
+        if(!prepared.empty()) {
+            const auto it=std::find(prepared.begin(),prepared.end(),p);
+            GGML_ASSERT(it!=prepared.end());return held[size_t(it-prepared.begin())];
+        }
+        if(!ggml_dsv4f_host_weights.acquire)return p;
+        const void * actual=ggml_dsv4f_host_weights.acquire(p,n);
+        GGML_ASSERT(release_fn);held.push_back(actual);return actual;
+    }
+    void copied(cudaStream_t stream) {
+        if(held.empty() || grouped)return;
+        CUDA_CHECK(cudaStreamSynchronize(stream));release_now();
+    }
+    void retire(cudaStream_t stream) {
+        if(held.empty())return;
+        if(!grouped){CUDA_CHECK(cudaStreamSynchronize(stream));release_now();return;}
+        auto batch=std::make_unique<retired>();batch->release=release_fn;batch->pointers=std::move(held);
+        auto * raw=batch.release();
+        const auto status=cudaLaunchHostFunc(stream,release_callback,raw);
+        if(status!=cudaSuccess){CUDA_CHECK(cudaStreamSynchronize(stream));release_callback(raw);CUDA_CHECK(status);}
+    }
+};
+
 struct prefill_state {
     int device;
     cudaStream_t copy = nullptr;
@@ -175,22 +240,34 @@ void ggml_cuda_dsv4f_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * node
     uint64_t copied = 0;
     auto upload = [&](int gi) {
         const int slot = gi%2, first = gi*group, count = std::min(group, int(active.size())-first);
+        prefill_host_leases host(true,state.copy,3*count);
         char * stage = scratch+layout.stage+slot*layout.stage_stride;
         if (gi >= 2) CUDA_CHECK(cudaStreamWaitEvent(state.copy, state.used[slot], 0));
+        if(ggml_dsv4f_host_weights.acquire_many) {
+            std::vector<const void *> pointers;std::vector<size_t> sizes;
+            for(int j=0;j<count;++j) {
+                if(cached && cache_plan.resident[first+j])continue;
+                for(const auto * tensor:{g,u,d}) {
+                    pointers.push_back((const char *)tensor->data+active[first+j]*tensor->nb[2]);sizes.push_back(tensor->nb[2]);
+                }
+            }
+            if(!pointers.empty())host.prepare(pointers,sizes);
+        }
         if (cached) {
             for (int j = 0; j < count; ++j) {
                 if (cache_plan.resident[first+j]) continue;
                 char * target = const_cast<char *>(cache_plan.experts[first+j]);
                 const int expert = active[first+j];
-                CUDA_CHECK(cudaMemcpyAsync(target, (const char *) g->data+expert*layout.gbytes,
+                CUDA_CHECK(cudaMemcpyAsync(target, host.acquire((const char *) g->data+expert*layout.gbytes,layout.gbytes),
                     layout.gbytes, cudaMemcpyHostToDevice, state.copy));
-                CUDA_CHECK(cudaMemcpyAsync(target+cache_plan.up_offset, (const char *) u->data+expert*layout.ubytes,
+                CUDA_CHECK(cudaMemcpyAsync(target+cache_plan.up_offset, host.acquire((const char *) u->data+expert*layout.ubytes,layout.ubytes),
                     layout.ubytes, cudaMemcpyHostToDevice, state.copy));
-                CUDA_CHECK(cudaMemcpyAsync(target+cache_plan.down_offset, (const char *) d->data+expert*layout.dbytes,
+                CUDA_CHECK(cudaMemcpyAsync(target+cache_plan.down_offset, host.acquire((const char *) d->data+expert*layout.dbytes,layout.dbytes),
                     layout.dbytes, cudaMemcpyHostToDevice, state.copy));
                 copied += layout.gbytes+layout.ubytes+layout.dbytes;
             }
             CUDA_CHECK(cudaEventRecord(state.ready[slot], state.copy));
+        host.retire(state.copy);
             return;
         }
         const ggml_tensor * tensors[] = {g, u, d};
@@ -199,16 +276,17 @@ void ggml_cuda_dsv4f_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * node
             // Coalesce adjacent selected experts within this group's plane.
             for (int j = 0; j < count;) {
                 int end = j+1;
-                while (end < count && active[first+end] == active[first+end-1]+1) ++end;
+                while (!ggml_dsv4f_host_weights.acquire && end < count && active[first+end] == active[first+end-1]+1) ++end;
                 const size_t bytes = (end-j)*tensor->nb[2];
                 CUDA_CHECK(cudaMemcpyAsync(stage+offset+j*tensor->nb[2],
-                    (const char *) tensor->data+active[first+j]*tensor->nb[2], bytes, cudaMemcpyHostToDevice, state.copy));
+                    host.acquire((const char *) tensor->data+active[first+j]*tensor->nb[2],bytes), bytes, cudaMemcpyHostToDevice, state.copy));
                 copied += bytes;
                 j = end;
             }
             offset += group*tensor->nb[2];
         }
         CUDA_CHECK(cudaEventRecord(state.ready[slot], state.copy));
+        host.retire(state.copy);
     };
     // Queue a complete ring before launching consumers. A slot is only reused
     // after its previous consumer has recorded used, avoiding a future-event wait.

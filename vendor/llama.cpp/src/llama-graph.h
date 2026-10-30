@@ -1000,6 +1000,7 @@ struct llm_graph_context {
     // Sequential MoE layers share one allocator-budgeted streamed-prefill
     // workspace. Independent scratch leaves would all be allocated up front.
     mutable ggml_tensor * dsv4f_prefill_scratch = nullptr;
+    std::map<const ggml_tensor *,ggml_tensor *> dsv4f_expert_maps;
     const llm_arch arch;
 
     const llama_hparams & hparams;

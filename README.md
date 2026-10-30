@@ -77,7 +77,37 @@ After installing the dependencies, put **all five main-model GGUF shards** and `
 ./run-server.sh
 ```
 
-The launcher requires swap protection: either system swap must already be disabled, or a working systemd user session with cgroup v2 memory control must allow `systemd-run --user --scope -p MemorySwapMax=0` (the launcher applies this automatically). It refuses to start if neither is available. Keep enough free RAM for resident model loading; the initial check requires at least the total main-model file size plus 2 GiB, with additional memory needed for MTP and runtime buffers.
+The launcher enforces swap protection and, with a positive RAM budget, a cgroup v2 process-tree RAM ceiling. It uses an inherited suitable cgroup or creates a systemd user scope with `MemoryMax` and `MemorySwapMax=0`. A working systemd user session with memory control is required if these limits are not already enforced. It refuses an unbounded launch if the limits cannot be applied.
+
+### RAM budget and adaptive experts
+
+| Variable | Launcher default | Behavior |
+| --- | ---: | --- |
+| `DSV4F_RAM_BUDGET_MIB` | `0` | Total process-tree RAM ceiling in MiB. `0` loads weights into resident memory; positive values enable VRAM/RAM/O_DIRECT SSD expert tiering. |
+| `DSV4F_RAM_PRELOAD` | `0` | `1` fills available expert RAM cache after contexts and warmup are ready. Requires a positive RAM budget. |
+| `DSV4F_ADAPTIVE_ROUTING` | `0` | `1` records decode expert usage, saves it after responses, and uses history for RAM/VRAM preload and eviction. |
+| `DSV4F_ADAPTIVE_PRUNING` | `0` | Integer `1..50`: target percentage of main-model routed expert weight bytes to exclude using historical usage per byte. `0` disables pruning. |
+
+Run from the repository root. Routing history is saved atomically as `models/<first GGUF shard stem>.routing.json` and reused after restarting. Startup warmup and weight transfers do not increment the counters. Routing and pruning cannot be enabled together.
+
+```bash
+# Collect representative usage and preload frequently used experts.
+DSV4F_RAM_BUDGET_MIB=131072 DSV4F_RAM_PRELOAD=1 DSV4F_ADAPTIVE_ROUTING=1 ./run-server.sh
+
+# Restart with read-only history and a 20% routed-weight exclusion target.
+DSV4F_RAM_BUDGET_MIB=131072 DSV4F_ADAPTIVE_ROUTING=0 DSV4F_ADAPTIVE_PRUNING=20 ./run-server.sh
+
+# Resident loading, with physically compacted expert weights when pruning is enabled.
+DSV4F_RAM_BUDGET_MIB=0 DSV4F_ADAPTIVE_PRUNING=20 ./run-server.sh
+```
+
+A positive budget keeps expert payloads on SSD and reads complete expert planes through O_DIRECT into a bounded RAM cache. Other weights and runtime buffers count against the same process ceiling. `DSV4F_RAM_RESERVE_MIB` (default `1024`) preserves runtime headroom; `DSV4F_RAM_CACHE_MIB` can impose a smaller expert-cache ceiling. Tiering disables pinned resident weights and caps prefill batches at 1024. `DSV4F_LOAD_PIPELINE_MIB` controls the resident allocation/read and RAM-preload pipelines; `0` disables pipelining. Direct native-library loading defaults to budget `0` when the environment variable is unset.
+
+Pruning preserves at least top-k experts in every layer and applies the exclusion mask before normal and vision top-k selection. In V4 hash-routed text layers, surviving hash choices stay intact; excluded choices are replaced with the most-used active experts without duplicates. Shared experts, attention, KV/compute buffers and the MTP drafter are excluded from the percentage target. Resident non-mmap loading omits excluded expert planes from allocation and reads, while mmap and tiered loading retain the original file layout and mask routing. The GGUF is unchanged. Missing, malformed, mismatched or empty per-layer history causes pruning startup to fail. Choose pruning percentages by validating output quality for your workload; V4.1 quality settings are not assumed to transfer to V4.
+
+With budget `0`, the startup RAM check requires the model sizes minus compacted expert bytes plus 2 GiB available, including the MTP model when enabled.
+
+See [Adaptive expert pruning](ADAPTIVE_EXPERT_PRUNING.md) for analysis of the collected V4 routing history, byte savings by pruning target, per-layer coverage and history-based starting settings.
 
 Once ready, open `http://localhost:8080`. The default API key is `dummykey`; set `API_KEY`, `HOST`, and `PORT` before starting to override the defaults.
 

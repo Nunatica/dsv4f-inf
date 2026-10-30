@@ -16,6 +16,9 @@ public:
     struct slot { int key=-1; bool ready=true; };
     struct decision { int key=-1,index=-1; };
     std::vector<slot> slots;
+    // Optional bounded historical prior; local observations retain their decay.
+    uint64_t (*history_score)(void *,int)=nullptr;
+    void * history_context=nullptr;
 
     void configure(mode value,uint64_t decay_requests=43*256,double replace_ratio=1.25) {
         clear();kind=value;period=std::max<uint64_t>(1,decay_requests);ratio=std::max(1.0,replace_ratio);
@@ -34,8 +37,11 @@ public:
     }
     uint64_t score(int key) const {
         if(key<0)return 0;
-        if(kind!=mode::legacy)return counts[key];
-        const auto it=legacy_counts.find(key);return it==legacy_counts.end()?0:it->second;
+        uint64_t local=0;
+        if(kind!=mode::legacy)local=counts[key];
+        else {const auto it=legacy_counts.find(key);if(it!=legacy_counts.end())local=it->second;}
+        const uint64_t prior=history_score?history_score(history_context,key):0;
+        return local>UINT64_MAX-prior?UINT64_MAX:local+prior;
     }
     bool contains(int key) const {return location[key]>=0 && slots[location[key]].ready;}
     void rebuild() {
