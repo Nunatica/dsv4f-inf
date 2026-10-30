@@ -198,7 +198,7 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
                 {{l.ffn_gate_exps->name,std::move(local),l.ffn_gate_exps->nb[2]+l.ffn_up_exps->nb[2]+l.ffn_down_exps->nb[2]}}});
         }
         const auto masks=dsv4f_pruning_masks(plans);
-        const bool compact=!ml.use_mmap && !dsv4f_direct_weights_enabled();
+        const bool compact=!ml.use_mmap;
         size_t original=0,retained=0;
         for(size_t i=0;i<masks.size();++i) {
             auto & l=layers[i];const auto & mask=masks[i];
@@ -243,7 +243,7 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
                 l.ffn_expert_ids=constant(GGML_TYPE_I32,1,n_expert,local.data(),"ids");
             }
         }
-        if(original)std::fprintf(stderr,"[dsv4f-pruning] resident weights: original_bytes=%zu active_bytes=%zu skipped_bytes=%zu (excluded planes not allocated or read)\n",original,retained,original-retained);
+        if(original)std::fprintf(stderr,"[dsv4f-pruning] %s weights: original_bytes=%zu active_bytes=%zu skipped_bytes=%zu (excluded planes not allocated or read)\n",dsv4f_direct_weights_enabled()?"tiered":"resident",original,retained,original-retained);
     }
 
 }

@@ -128,7 +128,13 @@ void read_aligned(int fd,void * dst,size_t n,uint64_t off,size_t required) {
 }
 struct source {
     std::unique_ptr<region> address;
-    struct span {uintptr_t begin;size_t bytes,expert;int fd;uint64_t offset;uint32_t file_index;void * routing;};
+    struct span {
+        uintptr_t begin;size_t bytes,expert;int fd;uint64_t offset;uint32_t file_index;void * routing;
+        std::vector<int32_t> expert_ids;
+        uint64_t file_offset(size_t local) const {
+            return offset+(expert_ids.empty()?local:size_t(expert_ids.at(local/expert))*expert);
+        }
+    };
     std::map<uintptr_t,span> spans;
     std::vector<int> fds;
     bool closing=false;
@@ -301,7 +307,7 @@ const void * acquire_impl(const void * ptr,size_t n,bool preload) {
         ++c.hits;
         return request->pointer;
     }
-    const uint64_t offset=span.offset+local;
+    const uint64_t offset=span.file_offset(local);
     const size_t delta=offset%alignment,total=rounded(delta+n);
     const uint64_t cap=c.limit();
     // Startup fills only unused room. Never scan/evict the already loaded
@@ -464,7 +470,7 @@ void preload_pipelined(const std::vector<preload_plane> & planes,dsv4f_preload_r
                 const size_t local=key-span.begin;
                 if(local>=span.bytes || plane.bytes!=span.expert || local%span.expert || plane.bytes>span.bytes-local)
                     throw std::runtime_error("invalid preload expert plane");
-                const uint64_t offset=span.offset+local;
+                const uint64_t offset=span.file_offset(local);
                 const size_t delta=offset%alignment,total=rounded(delta+plane.bytes);
                 const uint64_t cap=c.limit();
                 if(total>cap || c.used>cap-total || c.reserved>cap-total-c.used){result.budget_limited=true;break;}
@@ -584,7 +590,7 @@ void acquire_many_impl(const void * const * pointers,const size_t * sizes,const 
             if(loading!=c.loads.end()) {
                 tickets[i].request=loading->second;++loading->second->users;++c.hits;continue;
             }
-            const uint64_t offset=span.offset+local;
+            const uint64_t offset=span.file_offset(local);
             const size_t delta=offset%alignment,total=rounded(delta+n);
             if(total>cap)throw std::runtime_error("RAM budget has no room for a batched expert plane");
             while(c.used>cap-total || c.reserved>cap-total-c.used) {
@@ -903,6 +909,17 @@ ggml_backend_buffer_t dsv4f_direct_weights_buffer(const std::vector<dsv4f_direct
     std::map<int,int> opened;size_t at=0;
     // Prepare everything that can fail before registering the source.
     for(const auto & t:tensors) {
+        // Entire quantization tiers can disappear after pruning. They have no
+        // source span, but still receive a descriptor address below.
+        if(!ggml_nbytes(t.tensor))continue;
+        if(!t.expert_ids.empty()) {
+            if(t.expert_ids.size()!=size_t(t.tensor->ne[2]))throw std::runtime_error("invalid direct expert map size");
+            int32_t previous=-1;
+            for(int32_t id:t.expert_ids) {
+                if(id<=previous)throw std::runtime_error("invalid direct expert map order");
+                previous=id;
+            }
+        }
         if(!opened.count(t.fd)) {
             const std::string path="/proc/self/fd/"+std::to_string(t.fd);
             const int fd=open(path.c_str(),O_RDONLY|O_DIRECT|O_CLOEXEC);
@@ -910,7 +927,7 @@ ggml_backend_buffer_t dsv4f_direct_weights_buffer(const std::vector<dsv4f_direct
             owner->fds.push_back(fd);opened[t.fd]=fd;
         }
         const auto key=(uintptr_t)owner->address->data+at;
-        owner->spans.emplace(key,source::span{key,ggml_nbytes(t.tensor),t.tensor->nb[2],opened.at(t.fd),t.offset,t.file_index,ggml_dsv4f_routing_bind(t.tensor)});
+        owner->spans.emplace(key,source::span{key,ggml_nbytes(t.tensor),t.tensor->nb[2],opened.at(t.fd),t.offset,t.file_index,ggml_dsv4f_routing_bind(t.tensor),t.expert_ids});
         at+=rounded(ggml_nbytes(t.tensor));
     }
     auto & c=pool();

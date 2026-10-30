@@ -188,8 +188,8 @@ struct llama_file::impl {
             if (init_fd()) {
                 return;
             }
-            LLAMA_LOG_WARN("Failed to open file '%s' with error: %s. Falling back to buffered I/O",
-                           fname, strerror(errno));
+            throw std::runtime_error(format("failed to open '%s' with O_DIRECT: %s; buffered fallback refused",
+                                            fname, strerror(errno)));
         }
 #endif
         init_fp(mode);
@@ -288,21 +288,10 @@ struct llama_file::impl {
                     if (errno == EINTR) {
                         continue;  // Interrupted by signal, retry
                     }
-                    // Fallback to std::fread in case the DMA controller cannot access the buffer
+                    // An explicit DIO load must not allocate a second payload copy
+                    // in the page cache, including when no RAM budget is set.
                     if (errno == EFAULT || errno == EINVAL) {
-                        const char * budget = std::getenv("DSV4F_RAM_BUDGET_MIB");
-                        if (budget && std::strtoull(budget, nullptr, 10)) {
-                            throw std::runtime_error(format("O_DIRECT failed: %s; RAM budget forbids buffered fallback", strerror(errno)));
-                        }
-                        LLAMA_LOG_WARN("%s: Falling back to buffered IO due to %s\n", __func__, strerror(errno));
-                        auto curr_off = tell();
-                        close(fd);
-                        fd = -1;
-                        alignment = 1;
-                        init_fp("rb");
-                        seek(curr_off, SEEK_SET);
-                        read_raw_unsafe(ptr, len);
-                        return;
+                        throw std::runtime_error(format("O_DIRECT failed: %s; buffered fallback refused", strerror(errno)));
                     }
                     throw std::runtime_error(format("read error: %s", strerror(errno)));
                 }
@@ -317,12 +306,24 @@ struct llama_file::impl {
                 }
 
                 bytes_read += (size_t) ret;
+                // A short final sector leaves an unaligned cursor/buffer. Do
+                // not issue another DIO read there: it would fail with EINVAL.
+                if (bytes_read < len && tell() == size) {
+                    std::memset(reinterpret_cast<char *>(ptr) + bytes_read, 0, len - bytes_read);
+                    return;
+                }
             }
         }
     }
 
     void read_aligned_chunk(void * dest, size_t size) {
         size_t offset = tell();
+        if (offset > this->size || size > this->size - offset) {
+            throw std::runtime_error("unexpectedly reached end of file");
+        }
+        if (size == 0) {
+            return;
+        }
         off_t aligned_offset = offset & ~(alignment - 1);
         off_t offset_from_alignment = offset - aligned_offset;
         size_t bytes_to_read = (offset_from_alignment + size + alignment - 1) & ~(alignment - 1);

@@ -1400,9 +1400,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 }
 
 void llama_model_loader::compact_experts(ggml_tensor * tensor, const std::vector<int32_t> & keep) {
-    if (use_mmap || lazy.has(tensor) || dsv4f_direct_weights_enabled() || tensor->data ||
+    if (use_mmap || lazy.has(tensor) || tensor->data ||
         tensor->ne[3] != 1 || !ggml_is_contiguous(tensor) || expert_slices.count(tensor->name)) {
-        throw std::runtime_error("expert compaction requires unallocated resident tensors");
+        throw std::runtime_error("expert compaction requires unallocated non-mmap tensors");
     }
     const auto & source = require_weight(tensor->name);
     if (ggml_nbytes(source.tensor) != ggml_nbytes(tensor)) {

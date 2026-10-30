@@ -30,6 +30,8 @@ struct dsv4f_direct_tensor {
     int fd;
     uint64_t offset;
     uint32_t file_index=0;
+    // Packed execution plane -> original GGUF plane. Empty keeps file order.
+    std::vector<int32_t> expert_ids;
 };
 ggml_backend_buffer_t dsv4f_direct_weights_buffer(const std::vector<dsv4f_direct_tensor> & tensors);
 struct dsv4f_preload_result {

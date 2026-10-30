@@ -65,11 +65,11 @@ class MemoryBudgetTest(unittest.TestCase):
         result = subprocess.run([str(ROOT/'run-server.sh'), '--dry-run'], env=env,
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('RAM budget: 0 MiB; SSD payload I/O: resident', result.stdout)
+        self.assertIn('RAM budget: 0 MiB; SSD payload I/O: O_DIRECT', result.stdout)
         self.assertIn('Expert RAM preload: 0', result.stdout)
         self.assertIn('--cache-ram 0', result.stdout)
         self.assertIn('Adaptive expert routing: 0', result.stdout)
-        self.assertIn('--load-mode none', result.stdout)
+        self.assertIn('--load-mode dio', result.stdout)
         self.assertIn('--lazy-mode off', result.stdout)
         self.assertNotIn('--no-host', result.stdout)
         self.assertIn('--batch-size 5120 --ubatch-size 5120', result.stdout)
@@ -90,7 +90,7 @@ class MemoryBudgetTest(unittest.TestCase):
         legacy = subprocess.run([str(ROOT/'run-server.sh'), '--dry-run'],
                                 env={**env, 'DSV4F_RAM_BUDGET_MIB': '0'}, capture_output=True, text=True)
         self.assertEqual(legacy.returncode, 0, legacy.stderr)
-        self.assertIn('--load-mode none', legacy.stdout)
+        self.assertIn('--load-mode dio', legacy.stdout)
         self.assertNotIn('--no-host', legacy.stdout)
         self.assertIn('--batch-size 5120 --ubatch-size 5120', legacy.stdout)
 

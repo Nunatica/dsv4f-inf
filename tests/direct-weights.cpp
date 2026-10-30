@@ -201,6 +201,29 @@ int main() {
     ggml_dsv4f_host_weights_stats after_decode{};ggml_dsv4f_host_weights.statistics(&after_decode);
     require(after_decode.evictions>previous.evictions,"decode did not restore ordinary LRU");
     ggml_backend_buffer_free(b);ggml_free(ctx);
+    // Packed pruning IDs address nonconsecutive original file planes in all
+    // demand paths, including cold batches and background prefetch.
+    {
+        auto * packed_ctx=ggml_init({1<<20,nullptr,true});
+        auto * packed=ggml_new_tensor_3d(packed_ctx,GGML_TYPE_F32,128,128,3);
+        const std::vector<int32_t> original_ids={1,7,21};
+        auto * packed_buffer=dsv4f_direct_weights_buffer({{packed,fd,offset,0,original_ids}});
+        ggml_dsv4f_host_weights_stats before{},after{};ggml_dsv4f_host_weights.statistics(&before);
+        const void * pointers[]={packed->data,(char*)packed->data+plane};
+        const size_t sizes[]={plane,plane};const void * outputs[2]{};
+        ggml_dsv4f_host_weights.acquire_many(pointers,sizes,outputs,2);
+        for(int i=0;i<2;++i) {
+            require(!std::memcmp(outputs[i],expected.data()+offset+original_ids[i]*plane,plane),"packed cold batch original offsets");
+            ggml_dsv4f_host_weights.release(outputs[i]);
+        }
+        ggml_dsv4f_host_weights.prefetch((char*)packed->data+2*plane,plane);
+        {ggml_dsv4f_host_lease lease((char*)packed->data+2*plane,plane);
+            require(!std::memcmp(lease.data,expected.data()+offset+original_ids[2]*plane,plane),"packed prefetch original offset");}
+        ggml_dsv4f_host_weights.statistics(&after);
+        require(after.reads-before.reads==3 && after.resident_bytes==3*allocated_plane,"packed cache contains retained planes only");
+        preload=dsv4f_preload_experts();require(preload.planes==3 && !preload.read_bytes && !preload.budget_limited,"packed preload reuses demand planes");
+        ggml_backend_buffer_free(packed_buffer);ggml_free(packed_ctx);
+    }
     // Descriptor/tensor name order can differ from on-disk order. Shard index
     // takes precedence over offset, even with the later shard registered first.
     {

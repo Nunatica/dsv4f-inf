@@ -68,7 +68,8 @@ export DSV4F_GPU_JOIN=${DSV4F_GPU_JOIN:-1}
 export DSV4F_PINNED_COMPUTE=${DSV4F_PINNED_COMPUTE:-1}
 export DSV4F_PINNED_WEIGHTS=${DSV4F_PINNED_WEIGHTS:-$DSV4F_PINNED_COMPUTE}
 if ((ram_budget_mib)); then export DSV4F_PINNED_WEIGHTS=0; fi
-export DSV4F_LOAD_MODE=${DSV4F_LOAD_MODE:-none}
+# Resident loading also bypasses the page cache; explicit none remains available.
+export DSV4F_LOAD_MODE=${DSV4F_LOAD_MODE:-dio}
 if ((ram_budget_mib)); then export DSV4F_LOAD_MODE=dio; fi
 case "$DSV4F_LOAD_MODE" in none|dio) ;; *) echo 'DSV4F_LOAD_MODE must be none or dio.' >&2; exit 1;; esac
 export DSV4F_LOAD_PIPELINE_MIB=${DSV4F_LOAD_PIPELINE_MIB:-1024}
@@ -163,9 +164,10 @@ fi
 if [[ -n ${MMPROJ:-} ]]; then args+=(--mmproj "$MMPROJ"); fi
 if [[ ${1:-} == --dry-run ]]; then
     python3 "$ROOT/scripts/model_info.py" "$MODEL"
-    echo "RAM budget: $ram_budget_mib MiB; SSD payload I/O: $([[ $ram_budget_mib == 0 ]] && echo resident || echo O_DIRECT)"
+    echo "RAM budget: $ram_budget_mib MiB; SSD payload I/O: $([[ $DSV4F_LOAD_MODE == dio ]] && echo O_DIRECT || echo buffered)"
     echo "Adaptive expert routing: $DSV4F_ADAPTIVE_ROUTING"
     echo "Adaptive expert pruning: $DSV4F_ADAPTIVE_PRUNING% routed expert memory target"
+    echo "Allocation/read pipeline: $DSV4F_LOAD_PIPELINE_MIB MiB (0: disabled)"
     echo "Expert RAM preload: $DSV4F_RAM_PRELOAD (requires a positive RAM budget)"
     printf '%q ' "$BUILD_DIR/bin/dsv4f-server" "${args[@]}" "${@:2}"
     printf '\n'

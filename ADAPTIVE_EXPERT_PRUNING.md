@@ -24,7 +24,7 @@ DSV4F_RAM_BUDGET_MIB=131072 DSV4F_ADAPTIVE_ROUTING=0 DSV4F_ADAPTIVE_PRUNING=20 .
 
 Pruning startup rejects a missing, malformed or mismatched history, a main-model layer with no recorded calls, invalid percentages, and simultaneous routing collection and pruning.
 
-With budget `0` and non-mmap resident loading, excluded expert planes are neither allocated nor read. O_DIRECT tiering and mmap retain the original layout and mask routing. Their process RSS savings need not equal the excluded byte count; a positive RAM budget remains a configured ceiling.
+With non-mmap resident loading and O_DIRECT tiering, excluded expert planes are neither allocated nor read. Tiered descriptors pack active expert IDs and map reads back to the original GGUF offsets. RAM preload loads only retained experts, stopping after the retained set is resident if it fits the cache ceiling. Explicit mmap loading retains the original layout and masks routing. Total process RSS also includes other weights, alignment padding and runtime buffers; a positive RAM budget remains a ceiling, not a target allocation.
 
 ## Analyzed snapshot
 

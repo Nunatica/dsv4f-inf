@@ -10,6 +10,10 @@
 #include <mutex>
 #include <stdexcept>
 #include <unistd.h>
+#ifdef __linux__
+#include <fcntl.h>
+#include <sys/mman.h>
+#endif
 
 static void require(bool ok, const char * message) {
     if (!ok) {
@@ -20,7 +24,9 @@ static void require(bool ok, const char * message) {
 struct fixture {
     std::string path;
     fixture(bool invalid = false, bool large = false) {
-        char name[] = "/tmp/dsv4f-load-pipeline-XXXXXX";
+        // Use the build filesystem: /tmp may be tmpfs, where O_DIRECT does
+        // not exercise disk I/O or page-cache bypass.
+        char name[] = "./dsv4f-load-pipeline-XXXXXX";
         const int fd = mkstemp(name);
         require(fd >= 0, "mkstemp failed");
         close(fd);
@@ -42,6 +48,31 @@ struct fixture {
         require(gguf_write_to_file(meta.get(), path.c_str(), false), "write GGUF failed");
     }
     ~fixture() { std::remove(path.c_str()); }
+#ifdef __linux__
+    void drop_cache() const {
+        const int fd = open(path.c_str(), O_RDWR);
+        require(fd >= 0, "open cache probe failed");
+        const int synced = fdatasync(fd);
+        const int advised = posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+        close(fd);
+        require(synced == 0 && advised == 0, "drop fixture page cache failed");
+    }
+    void require_uncached(size_t bytes) const {
+        const size_t page = size_t(sysconf(_SC_PAGESIZE));
+        const size_t length = bytes / page * page; // Ignore the partial EOF page.
+        require(length > page, "cache probe needs multiple pages");
+        const int fd = open(path.c_str(), O_RDONLY);
+        require(fd >= 0, "open mincore probe failed");
+        void * mapping = mmap(nullptr, length, PROT_READ, MAP_PRIVATE, fd, 0);
+        close(fd);
+        require(mapping != MAP_FAILED, "mmap cache probe failed");
+        std::vector<unsigned char> residency(length / page);
+        const int result = mincore(mapping, length, residency.data());
+        munmap(mapping, length);
+        require(result == 0, "mincore failed");
+        for (auto state : residency) require(!(state & 1), "DIO load populated the file page cache");
+    }
+#endif
 };
 
 struct probe {
@@ -86,13 +117,23 @@ static bool progress(float value, void * data) {
     return value < p.cancel_at;
 }
 
-static void run(const std::string & mode) {
+static void run(const std::string & mode, bool direct) {
     // Make the truncated-file case larger than stdio's cached header block.
-    fixture file(mode == "invalid", mode == "read-error");
+    fixture file(mode == "invalid", direct || mode == "read-error");
     std::vector<std::string> splits;
     llama_model_loader loader(nullptr, nullptr, nullptr, file.path, splits, nullptr,
-            LLAMA_LOAD_MODE_NONE, true, false, false, nullptr, nullptr);
+            direct ? LLAMA_LOAD_MODE_DIRECT_IO : LLAMA_LOAD_MODE_NONE, true, false, false, nullptr, nullptr);
     loader.init_mappings();
+#ifdef __linux__
+    if (direct) {
+        require(loader.files.front()->has_direct_io(), "DIO source was buffered");
+        require(fcntl(loader.files.front()->file_id(), F_GETFL) & O_DIRECT, "O_DIRECT flag missing");
+        if (mode == "success") {
+            file.drop_cache();
+            file.require_uncached(loader.files.front()->size());
+        }
+    }
+#endif
     if (mode == "read-error") {
         require(truncate(file.path.c_str(), 0) == 0, "truncate failed");
     }
@@ -148,14 +189,57 @@ static void run(const std::string & mode) {
             }
         }
     }
-    std::printf("PASS load pipeline: %s\n", mode.c_str());
+#ifdef __linux__
+    if (direct && mode == "success") file.require_uncached(loader.files.front()->size());
+#endif
+    std::printf("PASS load pipeline: %s (%s)\n", mode.c_str(), direct ? "O_DIRECT" : "buffered");
 }
+
+#ifdef __linux__
+static void direct_errors() {
+    fixture source;
+    llama_file file(source.path.c_str(), "rb", true);
+    require(file.has_direct_io(), "DIO source was buffered");
+    // Deliberately violate the DIO offset alignment. An unlimited RAM budget
+    // must not allow a silent buffered retry.
+    void * buffer = nullptr;
+    require(posix_memalign(&buffer, file.read_alignment(), file.read_alignment()) == 0, "aligned allocation failed");
+    file.seek(1, SEEK_SET);
+    bool refused = false;
+    try {
+        file.read_raw_unsafe(buffer, file.read_alignment());
+    } catch (const std::runtime_error & error) {
+        refused = std::string(error.what()).find("buffered fallback refused") != std::string::npos;
+    }
+    free(buffer);
+    require(refused && file.has_direct_io(), "DIO failure silently switched to buffered I/O");
+    file.seek(file.size(), SEEK_SET);
+    char byte;
+    file.read_raw(&byte, 0);
+    bool eof = false;
+    try { file.read_raw(&byte, 1); } catch (const std::runtime_error &) { eof = true; }
+    require(eof, "DIO read beyond EOF was accepted");
+    refused = false;
+    try { llama_file unsupported("/proc/self/stat", "rb", true); }
+    catch (const std::runtime_error & error) {
+        refused = std::string(error.what()).find("buffered fallback refused") != std::string::npos;
+    }
+    require(refused, "unsupported DIO open silently switched to buffered I/O");
+    std::puts("PASS DIO open/read failures refuse buffered fallback with zero RAM budget");
+}
+#endif
 
 int main() {
     try {
-        for (const char * mode : {"success", "cancel-first", "cancel", "cancel-final", "invalid", "read-error", "allocation-error"}) {
-            run(mode);
+        setenv("DSV4F_RAM_BUDGET_MIB", "0", 1);
+        for (bool direct : {false, true}) {
+            for (const char * mode : {"success", "cancel-first", "cancel", "cancel-final", "invalid", "read-error", "allocation-error"}) {
+                run(mode, direct);
+            }
         }
+#ifdef __linux__
+        direct_errors();
+#endif
     } catch (const std::exception & error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;
